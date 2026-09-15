@@ -388,3 +388,154 @@ def test_feature_importance_is_sorted(classification_data):
     values = importance["importance"].tolist()
 
     assert values == sorted(values, reverse=True)
+# ---------------------------------------------------------------------------
+# Model catalogue coverage
+# ---------------------------------------------------------------------------
+
+def test_classification_model_catalogue(classification_data):
+    """All intended classification models should be recognized."""
+    X, y = classification_data
+
+    expected_models = {
+        "logistic_regression",
+        "random_forest",
+        "gradient_boosting",
+        "xgboost",
+        "lightgbm",
+        "catboost",
+    }
+
+    for model_name in expected_models:
+        result = fit_model(
+            X,
+            y,
+            model_name=model_name,
+            task="classification",
+            random_state=42,
+        )
+
+        assert isinstance(result, ModelResult)
+        assert result.model is not None
+        assert hasattr(result.model, "predict")
+
+
+def test_regression_model_catalogue(regression_data):
+    """All intended regression models should be recognized."""
+    X, y = regression_data
+
+    expected_models = {
+        "linear_regression",
+        "random_forest",
+        "gradient_boosting",
+        "xgboost",
+        "lightgbm",
+        "catboost",
+    }
+
+    for model_name in expected_models:
+        result = fit_model(
+            X,
+            y,
+            model_name=model_name,
+            task="regression",
+            random_state=42,
+        )
+
+        assert isinstance(result, ModelResult)
+        assert result.model is not None
+        assert hasattr(result.model, "predict")
+
+
+def test_classification_models_can_predict(classification_data):
+    """Every classification model should produce predictions."""
+    X, y = classification_data
+
+    models = [
+        "logistic_regression",
+        "random_forest",
+        "gradient_boosting",
+        "xgboost",
+        "lightgbm",
+        "catboost",
+    ]
+
+    for model_name in models:
+        result = fit_model(
+            X,
+            y,
+            model_name=model_name,
+            task="classification",
+            random_state=42,
+        )
+
+        predictions = predict(result.model, X)
+
+        assert isinstance(predictions, np.ndarray)
+        assert len(predictions) == len(X)
+
+
+def test_regression_models_can_predict(regression_data):
+    """Every regression model should produce predictions."""
+    X, y = regression_data
+
+    models = [
+        "linear_regression",
+        "random_forest",
+        "gradient_boosting",
+        "xgboost",
+        "lightgbm",
+        "catboost",
+    ]
+
+    for model_name in models:
+        result = fit_model(
+            X,
+            y,
+            model_name=model_name,
+            task="regression",
+            random_state=42,
+        )
+
+        predictions = predict(result.model, X)
+
+        assert isinstance(predictions, np.ndarray)
+        assert len(predictions) == len(X)
+
+
+def test_unknown_model_name_raises_error(classification_data):
+    """Unsupported model names should fail clearly."""
+    X, y = classification_data
+
+    with pytest.raises(ValueError):
+        fit_model(
+            X,
+            y,
+            model_name="not_a_real_model",
+            task="classification",
+        )
+
+
+def test_classification_only_model_rejected_for_regression(regression_data):
+    """Logistic regression must not be accepted for regression."""
+    X, y = regression_data
+
+    with pytest.raises(ValueError):
+        fit_model(
+            X,
+            y,
+            model_name="logistic_regression",
+            task="regression",
+        )
+
+
+def test_regression_only_model_rejected_for_classification(classification_data):
+    """Linear regression must not be accepted for classification."""
+    X, y = classification_data
+
+    with pytest.raises(ValueError):
+        fit_model(
+            X,
+            y,
+            model_name="linear_regression",
+            task="classification",
+        )

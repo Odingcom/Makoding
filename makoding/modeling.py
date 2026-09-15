@@ -268,11 +268,20 @@ def _build_estimator(
     model_name: str,
     random_state: int | None = 42,
 ) -> Any:
-    """Build a supported estimator from a simple model name."""
+    """Build a supported estimator from a simple model name.
+
+    Core scikit-learn models are always available. XGBoost, LightGBM,
+    and CatBoost are optional dependencies and are imported only when
+    the corresponding model is requested.
+    """
 
     _validate_task(task)
 
     name = model_name.strip().lower()
+
+    # ------------------------------------------------------------------
+    # Core scikit-learn models
+    # ------------------------------------------------------------------
 
     classification_models = {
         "logistic_regression": LogisticRegression(
@@ -305,15 +314,105 @@ def _build_estimator(
         else regression_models
     )
 
-    if name not in models:
-        raise ValueError(
-            f"Unknown model {model_name!r} for task={task!r}. "
-            f"Supported models: {sorted(models)}"
+    if name in models:
+        return models[name]
+
+    # ------------------------------------------------------------------
+    # XGBoost
+    # ------------------------------------------------------------------
+
+    if name == "xgboost":
+        try:
+            from xgboost import XGBClassifier, XGBRegressor
+        except ImportError as exc:
+            raise ImportError(
+                "XGBoost is required to use model_name='xgboost'. "
+                "Install it with: pip install xgboost"
+            ) from exc
+
+        if task == "classification":
+            return XGBClassifier(
+                n_estimators=200,
+                random_state=random_state,
+                eval_metric="logloss",
+            )
+
+        return XGBRegressor(
+            n_estimators=200,
+            random_state=random_state,
+            objective="reg:squarederror",
         )
 
-    return models[name]
+    # ------------------------------------------------------------------
+    # LightGBM
+    # ------------------------------------------------------------------
 
+    if name == "lightgbm":
+        try:
+            from lightgbm import LGBMClassifier, LGBMRegressor
+        except ImportError as exc:
+            raise ImportError(
+                "LightGBM is required to use model_name='lightgbm'. "
+                "Install it with: pip install lightgbm"
+            ) from exc
 
+        if task == "classification":
+            return LGBMClassifier(
+                n_estimators=200,
+                random_state=random_state,
+                verbosity=-1,
+            )
+
+        return LGBMRegressor(
+            n_estimators=200,
+            random_state=random_state,
+            verbosity=-1,
+        )
+
+    # ------------------------------------------------------------------
+    # CatBoost
+    # ------------------------------------------------------------------
+
+    if name == "catboost":
+        try:
+            from catboost import CatBoostClassifier, CatBoostRegressor
+        except ImportError as exc:
+            raise ImportError(
+                "CatBoost is required to use model_name='catboost'. "
+                "Install it with: pip install catboost"
+            ) from exc
+
+        if task == "classification":
+            return CatBoostClassifier(
+                iterations=200,
+                random_seed=random_state,
+                verbose=False,
+            )
+
+        return CatBoostRegressor(
+            iterations=200,
+            random_seed=random_state,
+            verbose=False,
+        )
+
+    # ------------------------------------------------------------------
+    # Unknown model
+    # ------------------------------------------------------------------
+
+    supported_models = sorted(
+        set(classification_models)
+        if task == "classification"
+        else set(regression_models)
+    )
+
+    supported_models.extend(
+        ["xgboost", "lightgbm", "catboost"]
+    )
+
+    raise ValueError(
+        f"Unknown model {model_name!r} for task={task!r}. "
+        f"Supported models: {sorted(supported_models)}"
+    )
 # ---------------------------------------------------------------------------
 # Train/test splitting
 # ---------------------------------------------------------------------------

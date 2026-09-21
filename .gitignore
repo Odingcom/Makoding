@@ -40,3 +40,8 @@ build/
 
 # Logs
 *.log
+# Generated ML artifacts
+catboost_info/
+
+# Temporary test files
+html_test.py

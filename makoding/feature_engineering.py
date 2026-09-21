@@ -277,16 +277,35 @@ class NumericScaler:
         return self
 
     def transform(self, frame: pd.DataFrame) -> pd.DataFrame:
-        """Apply the previously-learned scaling to ``frame``."""
+        """Apply the previously-learned scaling to ``frame``.
+
+        Scaling always produces floating-point values, even when the source
+        columns are integer-valued. The scaled columns are therefore built
+        as a new ``float64`` DataFrame and then combined with the untouched
+        columns. This avoids pandas dtype errors and future warnings caused
+        by assigning floating-point values into integer columns.
+        """
         if not self._is_fitted:
             raise NotFittedError("NumericScaler is not fitted. Call 'fit' before 'transform'.")
 
+        _validate_dataframe(frame)
         _validate_columns_exist(frame, self.columns_)
+        _validate_numeric_columns(frame, self.columns_)
         _validate_no_missing(frame, self.columns_)
 
-        result = frame.copy(deep=True)
-        result.loc[:, self.columns_] = self._scaler.transform(frame[self.columns_])
-        return result
+        scaled_values = self._scaler.transform(frame.loc[:, self.columns_])
+        scaled_frame = pd.DataFrame(
+            scaled_values,
+            index=frame.index,
+            columns=self.columns_,
+        )
+
+        # Keep every non-scaled column exactly as supplied, while replacing
+        # the selected numeric columns with their floating-point transforms.
+        untouched = frame.drop(columns=self.columns_).copy(deep=True)
+
+        result = pd.concat([untouched, scaled_frame], axis=1)
+        return result.loc[:, frame.columns]
 
     def fit_transform(
         self, frame: pd.DataFrame, columns: Sequence[str] | None = None

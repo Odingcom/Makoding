@@ -179,9 +179,9 @@ def test_apply_pca(clustering_data):
         random_state=42,
     )
 
-    assert isinstance(result, pd.DataFrame)
-    assert result.shape == (len(clustering_data), 1)
-    assert result.columns.tolist() == ["PC1"]
+    assert isinstance(result.transformed, pd.DataFrame)
+    assert result.transformed.shape == (len(clustering_data), 1)
+    assert result.transformed.columns.tolist() == ["PC1"]
 
 
 def test_apply_pca_multiple_components(clustering_data):
@@ -190,8 +190,8 @@ def test_apply_pca_multiple_components(clustering_data):
         n_components=2,
     )
 
-    assert result.shape == clustering_data.shape
-    assert result.columns.tolist() == ["PC1", "PC2"]
+    assert result.transformed.shape == clustering_data.shape
+    assert result.transformed.columns.tolist() == ["PC1", "PC2"]
 
 
 def test_apply_pca_invalid_components(clustering_data):

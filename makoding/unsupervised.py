@@ -102,16 +102,6 @@ def _validate_finite_values(frame: pd.DataFrame) -> None:
 def standardize_features(frame: pd.DataFrame) -> pd.DataFrame:
     """
     Standardize numeric features using StandardScaler.
-
-    Parameters
-    ----------
-    frame:
-        Numeric feature DataFrame.
-
-    Returns
-    -------
-    pandas.DataFrame
-        Standardized features with the original index and column names.
     """
     _validate_dataframe(frame)
     _validate_finite_values(frame)
@@ -134,22 +124,6 @@ def fit_kmeans(
     n_init: int | str = 10,
     **kwargs,
 ) -> ClusteringResult:
-    """
-    Fit a K-Means clustering model.
-
-    Parameters
-    ----------
-    frame:
-        Numeric feature DataFrame.
-    n_clusters:
-        Number of clusters.
-    random_state:
-        Random seed.
-    n_init:
-        Number of centroid initializations.
-    **kwargs:
-        Additional KMeans parameters.
-    """
     _validate_dataframe(frame)
     _validate_finite_values(frame)
     _validate_cluster_count(n_clusters, len(frame))
@@ -177,22 +151,6 @@ def fit_agglomerative(
     metric: str = "euclidean",
     **kwargs,
 ) -> ClusteringResult:
-    """
-    Fit an agglomerative hierarchical clustering model.
-
-    Parameters
-    ----------
-    frame:
-        Numeric feature DataFrame.
-    n_clusters:
-        Number of clusters.
-    linkage:
-        Linkage criterion.
-    metric:
-        Distance metric supported by the selected linkage method.
-    **kwargs:
-        Additional AgglomerativeClustering parameters.
-    """
     _validate_dataframe(frame)
     _validate_finite_values(frame)
     _validate_cluster_count(n_clusters, len(frame))
@@ -225,24 +183,6 @@ def fit_dbscan(
     metric: str = "euclidean",
     **kwargs,
 ) -> ClusteringResult:
-    """
-    Fit a DBSCAN clustering model.
-
-    DBSCAN labels noise observations as ``-1``.
-
-    Parameters
-    ----------
-    frame:
-        Numeric feature DataFrame.
-    eps:
-        Maximum neighborhood radius.
-    min_samples:
-        Minimum number of samples required to form a dense region.
-    metric:
-        Distance metric.
-    **kwargs:
-        Additional DBSCAN parameters.
-    """
     _validate_dataframe(frame)
     _validate_finite_values(frame)
 
@@ -277,28 +217,7 @@ def apply_pca(
     random_state: int | None = 42,
     prefix: str = "PC",
     **kwargs,
-) -> pd.DataFrame:
-    """
-    Apply Principal Component Analysis.
-
-    Parameters
-    ----------
-    frame:
-        Numeric feature DataFrame.
-    n_components:
-        Number or proportion of components.
-    random_state:
-        Random seed where applicable.
-    prefix:
-        Prefix used for transformed component names.
-    **kwargs:
-        Additional PCA parameters.
-
-    Returns
-    -------
-    pandas.DataFrame
-        PCA-transformed features.
-    """
+) -> PCAResult:
     _validate_dataframe(frame)
     _validate_finite_values(frame)
 
@@ -337,10 +256,16 @@ def apply_pca(
         for index in range(transformed.shape[1])
     ]
 
-    return pd.DataFrame(
+    transformed_frame = pd.DataFrame(
         transformed,
         index=frame.index,
         columns=columns,
+    )
+
+    return PCAResult(
+        model=model,
+        transformed=transformed_frame,
+        explained_variance_ratio=model.explained_variance_ratio_,
     )
 
 
@@ -351,12 +276,6 @@ def silhouette_score(
     metric: str = "euclidean",
     **kwargs,
 ) -> float:
-    """
-    Calculate the mean silhouette coefficient.
-
-    Silhouette scores range from -1 to 1, where larger values generally
-    indicate better-defined clusters.
-    """
     _validate_dataframe(frame)
     _validate_finite_values(frame)
 
@@ -390,9 +309,6 @@ def silhouette_score(
 
 
 def kmeans_inertia(result: ClusteringResult) -> float:
-    """
-    Return the inertia from a fitted K-Means result.
-    """
     if not isinstance(result, ClusteringResult):
         raise TypeError(
             "result must be a ClusteringResult."
@@ -416,14 +332,6 @@ def kmeans_elbow(
     n_init: int | str = 10,
     **kwargs,
 ) -> pd.DataFrame:
-    """
-    Calculate K-Means inertia across a range of cluster counts.
-
-    Returns a DataFrame with columns:
-
-    - ``n_clusters``
-    - ``inertia``
-    """
     _validate_dataframe(frame)
     _validate_finite_values(frame)
 
@@ -460,16 +368,6 @@ def cluster_summary(
     *,
     cluster_column: str = "cluster",
 ) -> pd.DataFrame:
-    """
-    Generate a numerical profile for each cluster.
-
-    The output contains:
-
-    - cluster identifier
-    - observation count
-    - mean for each numeric feature
-    - standard deviation for each numeric feature
-    """
     if not isinstance(frame, pd.DataFrame):
         raise TypeError("frame must be a pandas DataFrame.")
 
@@ -526,12 +424,6 @@ def k_distance_analysis(
     k: int = 5,
     metric: str = "euclidean",
 ) -> pd.DataFrame:
-    """
-    Calculate each observation's distance to its k-th nearest neighbor.
-
-    The returned distances are sorted ascending, which makes the result
-    suitable for identifying an approximate DBSCAN ``eps`` value.
-    """
     _validate_dataframe(frame)
     _validate_finite_values(frame)
 

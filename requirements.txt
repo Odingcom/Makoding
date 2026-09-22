@@ -1,0 +1,11 @@
+streamlit
+pandas
+numpy
+scipy
+scikit-learn
+matplotlib
+requests
+openpyxl
+xgboost
+lightgbm
+catboost

@@ -45,3 +45,9 @@ catboost_info/
 
 # Temporary test files
 html_test.py
+
+# Generated ML artifacts
+catboost_info/
+
+# Temporary test files
+html_test.py

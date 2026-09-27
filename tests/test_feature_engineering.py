@@ -16,6 +16,8 @@ import pandas as pd
 import pytest
 
 from makoding.feature_engineering import (
+    FeaturePipeline,
+    FeatureSchema,
     CategoricalEncoder,
     MissingIndicatorAdder,
     NotFittedError,
@@ -62,8 +64,8 @@ def train_test_numeric():
 def train_test_categorical():
     """A train/test split where the test split contains a category
     ('z') never seen in training."""
-    train = pd.DataFrame({"cat": ["a", "b", "a", "c", None]})
-    test = pd.DataFrame({"cat": ["a", "z", "b", None]})
+    train = pd.DataFrame({"cat": ["a", "b", "a", "c", np.nan]})
+    test = pd.DataFrame({"cat": ["a", "z", "b", np.nan]})
     return train, test
 
 
@@ -715,6 +717,279 @@ class TestCorrelatedFeatures:
         drop_correlated_features(redundant_frame, threshold=0.99)
         pd.testing.assert_frame_equal(redundant_frame, original)
 
+
+
+# ---------------------------------------------------------------------------
+# FeatureSchema
+# ---------------------------------------------------------------------------
+
+class TestFeatureSchema:
+    def test_from_frame_records_exact_schema(self):
+        frame = pd.DataFrame({"a": [1, 2], "b": [3, 4]})
+        schema = FeatureSchema.from_frame(frame)
+
+        assert schema.columns == ("a", "b")
+        assert schema.n_features == 2
+
+    def test_rejects_duplicate_frame_columns(self):
+        frame = pd.DataFrame([[1, 2]], columns=["a", "a"])
+        with pytest.raises(ValueError, match="duplicate"):
+            FeatureSchema.from_frame(frame)
+
+    def test_validate_accepts_exact_schema(self):
+        schema = FeatureSchema.from_frame(
+            pd.DataFrame({"a": [1, 2], "b": [3, 4]})
+        )
+        schema.validate(pd.DataFrame({"a": [10], "b": [20]}))
+
+    def test_validate_rejects_reordered_columns(self):
+        schema = FeatureSchema.from_frame(
+            pd.DataFrame({"a": [1, 2], "b": [3, 4]})
+        )
+        with pytest.raises(ValueError, match="Feature schema mismatch"):
+            schema.validate(pd.DataFrame({"b": [20], "a": [10]}))
+
+
+# ---------------------------------------------------------------------------
+# FeaturePipeline
+# ---------------------------------------------------------------------------
+
+class TestFeaturePipeline:
+    def test_rejects_empty_steps(self):
+        with pytest.raises(ValueError):
+            FeaturePipeline([])
+
+    def test_rejects_malformed_step(self):
+        with pytest.raises(TypeError):
+            FeaturePipeline([("scale",)])
+
+    def test_rejects_duplicate_step_names(self):
+        with pytest.raises(ValueError, match="Duplicate pipeline step name"):
+            FeaturePipeline(
+                [
+                    ("scale", NumericScaler()),
+                    ("scale", NumericScaler()),
+                ]
+            )
+
+    def test_rejects_step_without_fit_and_transform(self):
+        with pytest.raises(TypeError, match="must expose callable fit"):
+            FeaturePipeline([("bad", object())])
+
+    def test_fit_and_transform_are_leakage_safe(self):
+        train = pd.DataFrame(
+            {
+                "age": [20.0, 30.0, 40.0, 50.0],
+                "segment": ["a", "b", "a", "b"],
+            }
+        )
+        test = pd.DataFrame(
+            {
+                "age": [100.0, 110.0],
+                "segment": ["a", "z"],
+            }
+        )
+
+        pipeline = FeaturePipeline(
+            [
+                ("scale", NumericScaler(method="standard"), {"columns": ["age"]}),
+                (
+                    "encode",
+                    CategoricalEncoder(method="onehot"),
+                    {"columns": ["segment"]},
+                ),
+            ]
+        )
+
+        pipeline.fit(train)
+        transformed = pipeline.transform(test)
+
+        expected_age = (
+            test["age"] - train["age"].mean()
+        ) / train["age"].std(ddof=0)
+
+        pd.testing.assert_series_equal(
+            transformed["age"],
+            expected_age,
+            check_names=False,
+        )
+
+        # The unseen test category must not create a new training schema column.
+        assert "segment_z" not in transformed.columns
+        assert pipeline.feature_names_in_ == ("age", "segment")
+        assert pipeline.feature_names_out_ == tuple(transformed.columns)
+
+    def test_transform_before_fit_raises(self):
+        pipeline = FeaturePipeline([("scale", NumericScaler())])
+        with pytest.raises(NotFittedError):
+            pipeline.transform(pd.DataFrame({"a": [1.0, 2.0]}))
+
+    def test_transform_rejects_reordered_input_schema(self):
+        train = pd.DataFrame(
+            {
+                "a": [1.0, 2.0, 3.0],
+                "b": [10.0, 20.0, 30.0],
+            }
+        )
+        pipeline = FeaturePipeline(
+            [("scale", NumericScaler(), {"columns": ["a", "b"]})]
+        ).fit(train)
+
+        with pytest.raises(ValueError, match="Feature schema mismatch"):
+            pipeline.transform(train[["b", "a"]])
+
+    def test_fit_transform_matches_fit_then_transform(self):
+        train = pd.DataFrame(
+            {
+                "a": [1.0, 2.0, 3.0],
+                "b": [4.0, 5.0, 6.0],
+            }
+        )
+        steps = [
+            ("scale", NumericScaler(method="minmax"), {"columns": ["a", "b"]})
+        ]
+
+        first = FeaturePipeline(steps).fit_transform(train)
+        second_pipeline = FeaturePipeline(
+            [("scale", NumericScaler(method="minmax"), {"columns": ["a", "b"]})]
+        )
+        second_pipeline.fit(train)
+        second = second_pipeline.transform(train)
+
+        pd.testing.assert_frame_equal(first, second)
+
+    def test_does_not_mutate_original(self):
+        train = pd.DataFrame(
+            {
+                "a": [1.0, 2.0, 3.0],
+                "b": [4.0, 5.0, 6.0],
+            }
+        )
+        original = train.copy(deep=True)
+
+        FeaturePipeline(
+            [("scale", NumericScaler(), {"columns": ["a", "b"]})]
+        ).fit_transform(train)
+
+        pd.testing.assert_frame_equal(train, original)
+
+    def test_named_steps_exposes_transformers(self):
+        pipeline = FeaturePipeline(
+            [("scale", NumericScaler()), ("encode", CategoricalEncoder())]
+        )
+
+        assert isinstance(pipeline.named_steps_["scale"], NumericScaler)
+        assert isinstance(pipeline.named_steps_["encode"], CategoricalEncoder)
+
+    def test_feature_lineage_requires_fit(self):
+        pipeline = FeaturePipeline([("scale", NumericScaler())])
+        with pytest.raises(NotFittedError):
+            pipeline.get_feature_lineage()
+
+    def test_feature_lineage_is_inspectable(self):
+        train = pd.DataFrame(
+            {
+                "age": [20.0, 30.0, 40.0],
+                "segment": ["a", "b", "a"],
+            }
+        )
+        pipeline = FeaturePipeline(
+            [
+                ("scale", NumericScaler(), {"columns": ["age"]}),
+                (
+                    "encode",
+                    CategoricalEncoder(method="onehot"),
+                    {"columns": ["segment"]},
+                ),
+            ]
+        ).fit(train)
+
+        lineage = pipeline.get_feature_lineage()
+
+        assert {"feature", "source_features"} == set(lineage.columns)
+        assert set(lineage["feature"]) == set(pipeline.feature_names_out_)
+
+    def test_pipeline_rejects_stage_output_schema_drift(self):
+        train = pd.DataFrame({"a": [1.0, 2.0, 3.0]})
+        pipeline = FeaturePipeline(
+            [("scale", NumericScaler(), {"columns": ["a"]})]
+        ).fit(train)
+
+        # The fitted pipeline expects the same input schema and order.
+        with pytest.raises(ValueError, match="Feature schema mismatch"):
+            pipeline.transform(pd.DataFrame({"extra": [1.0], "a": [2.0]}))
+
+
+# ---------------------------------------------------------------------------
+# Production validation guarantees
+# ---------------------------------------------------------------------------
+
+class TestProductionValidation:
+    def test_public_transformer_rejects_duplicate_dataframe_columns(self):
+        frame = pd.DataFrame([[1.0, 2.0]], columns=["a", "a"])
+
+        with pytest.raises(ValueError, match="duplicate"):
+            NumericScaler().fit(frame)
+
+    def test_generated_feature_name_collision_is_rejected(self):
+        frame = pd.DataFrame(
+            {
+                "a": [1.0, 2.0],
+                "b": [2.0, 4.0],
+                "r": [99.0, 99.0],
+            }
+        )
+
+        with pytest.raises(ValueError, match="already exist"):
+            create_ratio_features(frame, {"r": ("a", "b")})
+
+    def test_datetime_generated_name_collision_is_rejected(self):
+        frame = pd.DataFrame(
+            {
+                "d": ["2024-01-01", "2024-01-02"],
+                "d_year": [1, 2],
+            }
+        )
+
+        with pytest.raises(ValueError, match="already exist"):
+            add_datetime_features(frame, "d", components=["year"])
+
+    def test_cyclical_generated_name_collision_is_rejected(self):
+        frame = pd.DataFrame(
+            {
+                "hour": [0, 12],
+                "hour_sin": [0.0, 0.0],
+            }
+        )
+
+        with pytest.raises(ValueError, match="already exist"):
+            add_cyclical_features(frame, "hour", period=24)
+
+    @pytest.mark.parametrize(
+        "value",
+        [np.nan, np.inf, -np.inf],
+    )
+    def test_target_encoder_rejects_non_finite_smoothing(self, value):
+        with pytest.raises(ValueError, match="finite"):
+            TargetEncoder(smoothing=value)
+
+    @pytest.mark.parametrize(
+        "period",
+        [np.nan, np.inf, -np.inf],
+    )
+    def test_cyclical_features_reject_non_finite_period(self, period):
+        frame = pd.DataFrame({"hour": [0, 1]})
+
+        with pytest.raises(ValueError, match="finite"):
+            add_cyclical_features(frame, "hour", period=period)
+
+    @pytest.mark.parametrize(
+        "threshold",
+        [np.nan, np.inf, -np.inf],
+    )
+    def test_low_variance_rejects_non_finite_threshold(self, redundant_frame, threshold):
+        with pytest.raises(ValueError, match="finite"):
+            low_variance_features(redundant_frame, threshold=threshold)
 
 # ---------------------------------------------------------------------------
 # Cross-cutting: every function rejects non-DataFrame input

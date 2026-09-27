@@ -25,8 +25,14 @@ Two APIs, by design
   purely for quick one-off use — reach for the class directly the
   moment you have more than one dataset split to process consistently.
 
-Design principles
-------------------
+Production guarantees
+---------------------
+- Stateful transformers preserve learned statistics and expose fitted
+  schema metadata (``feature_names_in_`` / ``feature_names_out_`` where
+  applicable).
+- :class:`FeaturePipeline` provides sequential, leakage-safe composition
+  with exact schema checks at every stage and inspectable feature lineage.
+- Generated feature names are protected against accidental collisions.
 - Public functions and classes validate their inputs and raise
   informative, typed errors (``TypeError``, ``ValueError``, ``KeyError``).
 - Caller DataFrames are never mutated.
@@ -44,7 +50,8 @@ Design principles
 from __future__ import annotations
 
 import logging
-from typing import Any, Literal, Sequence
+from dataclasses import dataclass, field
+from typing import Any, Literal, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -67,6 +74,8 @@ __all__ = [
     "TargetEncoder",
     "MissingIndicatorAdder",
     "NotFittedError",
+    "FeatureSchema",
+    "FeaturePipeline",
     # One-shot convenience wrappers around the transformers above
     "scale_numeric_features",
     "encode_categorical_features",
@@ -116,14 +125,217 @@ class NotFittedError(RuntimeError):
     """Raised when ``transform`` is called before ``fit`` on a stateful transformer."""
 
 
+@dataclass(frozen=True)
+class FeatureSchema:
+    """Immutable record of a feature matrix schema.
+
+    The schema records the exact column order observed at a pipeline
+    boundary. It is intentionally lightweight so it remains easy to
+    serialize with ``pickle``/``joblib`` and inspect during debugging.
+    """
+
+    columns: tuple[str, ...]
+    n_features: int
+
+    @classmethod
+    def from_frame(cls, frame: pd.DataFrame) -> "FeatureSchema":
+        _validate_dataframe(frame)
+        return cls(tuple(str(c) for c in frame.columns), len(frame.columns))
+
+    def validate(self, frame: pd.DataFrame, *, stage: str = "transform") -> None:
+        """Require an exact column set and order at a pipeline boundary."""
+        _validate_dataframe(frame)
+        actual = tuple(str(c) for c in frame.columns)
+        if actual != self.columns:
+            missing = [c for c in self.columns if c not in actual]
+            extra = [c for c in actual if c not in self.columns]
+            raise ValueError(
+                f"Feature schema mismatch during {stage}. "
+                f"Expected {list(self.columns)!r}; got {list(actual)!r}. "
+                f"Missing={missing!r}, extra={extra!r}."
+            )
+
+
+@dataclass
+class _PipelineStep:
+    """Internal normalized representation of one pipeline stage."""
+
+    name: str
+    transformer: Any
+    fit_kwargs: dict[str, Any] = field(default_factory=dict)
+    input_schema: FeatureSchema | None = None
+    output_schema: FeatureSchema | None = None
+
+
+class FeaturePipeline:
+    """Composable, leakage-safe feature-engineering pipeline.
+
+    Each stage must expose ``fit`` and ``transform``. Fit-time keyword
+    arguments are supplied once through ``steps`` and are never inferred
+    from validation/test data. The pipeline records the schema at every
+    stage, so a fitted pipeline cannot silently consume a differently
+    ordered or differently shaped feature matrix.
+
+    ``steps`` accepts either:
+
+    ``[(name, transformer)]``
+        For transformers whose ``fit`` needs no additional arguments.
+
+    ``[(name, transformer, fit_kwargs)]``
+        For transformers such as :class:`NumericBinner` or
+        :class:`TargetEncoder` whose ``fit`` requires configuration.
+
+    Example
+    -------
+    ``FeaturePipeline([
+        ("scale", NumericScaler(), {"columns": ["age", "income"]}),
+        ("encode", CategoricalEncoder(), {"columns": ["segment"]}),
+    ])``
+
+    The pipeline itself never fits on test/inference data. Call ``fit``
+    exactly once for the training data, then call ``transform`` for every
+    other split.
+    """
+
+    def __init__(self, steps: Sequence[Any]) -> None:
+        if not steps:
+            raise ValueError("steps must contain at least one transformer.")
+
+        normalized: list[_PipelineStep] = []
+        names: set[str] = set()
+        for item in steps:
+            if not isinstance(item, (tuple, list)) or len(item) not in {2, 3}:
+                raise TypeError(
+                    "Each pipeline step must be (name, transformer) or "
+                    "(name, transformer, fit_kwargs)."
+                )
+            name = item[0]
+            transformer = item[1]
+            fit_kwargs = dict(item[2]) if len(item) == 3 else {}
+            if not isinstance(name, str) or not name.strip():
+                raise TypeError("Pipeline step names must be non-empty strings.")
+            if name in names:
+                raise ValueError(f"Duplicate pipeline step name: {name!r}")
+            if not callable(getattr(transformer, "fit", None)) or not callable(
+                getattr(transformer, "transform", None)
+            ):
+                raise TypeError(
+                    f"Pipeline step {name!r} must expose callable fit() and transform() methods."
+                )
+            names.add(name)
+            normalized.append(_PipelineStep(name, transformer, fit_kwargs))
+
+        self.steps_: list[_PipelineStep] = normalized
+        self.feature_names_in_: tuple[str, ...] | None = None
+        self.feature_names_out_: tuple[str, ...] | None = None
+        self.lineage_: dict[str, list[str]] = {}
+        self._is_fitted = False
+
+    @property
+    def named_steps_(self) -> dict[str, Any]:
+        """Return the fitted transformer objects keyed by stage name."""
+        return {step.name: step.transformer for step in self.steps_}
+
+    @staticmethod
+    def _update_lineage(
+        lineage: dict[str, list[str]], before: Sequence[str], after: Sequence[str]
+    ) -> dict[str, list[str]]:
+        before_set = set(before)
+        updated: dict[str, list[str]] = {}
+        for column in after:
+            if column in before_set:
+                updated[column] = lineage.get(column, [column])
+            else:
+                # Newly created columns are attributed to the stage's
+                # immediately preceding feature space. This deliberately
+                # avoids pretending to know semantic ancestry that the
+                # arbitrary transformer cannot expose.
+                updated[column] = list(before)
+        return updated
+
+    def fit(self, frame: pd.DataFrame) -> "FeaturePipeline":
+        """Fit every stage sequentially on training data."""
+        _validate_dataframe(frame)
+        current = frame.copy(deep=True)
+        self.feature_names_in_ = tuple(str(c) for c in current.columns)
+        lineage = {str(c): [str(c)] for c in current.columns}
+
+        for step in self.steps_:
+            step.input_schema = FeatureSchema.from_frame(current)
+            step.transformer.fit(current, **step.fit_kwargs)
+            current = step.transformer.transform(current)
+            _validate_dataframe(current)
+            _validate_unique_frame_columns(current)
+            step.output_schema = FeatureSchema.from_frame(current)
+            lineage = self._update_lineage(
+                lineage, step.input_schema.columns, step.output_schema.columns
+            )
+
+        self.feature_names_out_ = tuple(str(c) for c in current.columns)
+        self.lineage_ = lineage
+        self._is_fitted = True
+        logger.debug(
+            "FeaturePipeline.fit: %d stages, %d input features, %d output features",
+            len(self.steps_),
+            len(self.feature_names_in_),
+            len(self.feature_names_out_),
+        )
+        return self
+
+    def transform(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Transform data using only statistics learned during ``fit``."""
+        if not self._is_fitted:
+            raise NotFittedError("FeaturePipeline is not fitted. Call 'fit' before 'transform'.")
+        _validate_dataframe(frame)
+        expected = FeatureSchema(tuple(self.feature_names_in_), len(self.feature_names_in_))
+        expected.validate(frame)
+
+        current = frame.copy(deep=True)
+        for step in self.steps_:
+            if step.input_schema is None or step.output_schema is None:
+                raise RuntimeError(f"Pipeline step {step.name!r} has incomplete fitted state.")
+            step.input_schema.validate(current, stage=f"pipeline step {step.name!r}")
+            current = step.transformer.transform(current)
+            step.output_schema.validate(current, stage=f"pipeline output {step.name!r}")
+        return current
+
+    def fit_transform(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Fit the pipeline on ``frame`` and return its transformed result."""
+        return self.fit(frame).transform(frame)
+
+    def get_feature_lineage(self) -> pd.DataFrame:
+        """Return an inspectable feature-lineage table after fitting."""
+        if not self._is_fitted:
+            raise NotFittedError(
+                "FeaturePipeline is not fitted. Call 'fit' before requesting lineage."
+            )
+        return pd.DataFrame(
+            [
+                {
+                    "feature": feature,
+                    "source_features": sources,
+                }
+                for feature, sources in self.lineage_.items()
+            ]
+        )
+
+
 # ---------------------------------------------------------------------------
 # Shared validation helpers
 # ---------------------------------------------------------------------------
 
 def _validate_dataframe(frame: Any) -> None:
-    """Validate that ``frame`` is a pandas DataFrame."""
+    """Validate that ``frame`` is a DataFrame with a unique column schema."""
     if not isinstance(frame, pd.DataFrame):
         raise TypeError(f"frame must be a pandas DataFrame, got {type(frame).__name__!r}")
+    _validate_unique_frame_columns(frame)
+
+
+def _validate_unique_frame_columns(frame: pd.DataFrame) -> None:
+    """Reject duplicate DataFrame column names, which are unsafe for feature work."""
+    if not frame.columns.is_unique:
+        duplicates = frame.columns[frame.columns.duplicated()].unique().tolist()
+        raise ValueError(f"DataFrame contains duplicate column names: {duplicates}")
 
 
 def _validate_columns_exist(frame: pd.DataFrame, columns: Sequence[str]) -> None:
@@ -172,6 +384,30 @@ def _validate_no_missing(frame: pd.DataFrame, columns: Sequence[str]) -> None:
             f"Column(s) contain missing values: {affected}. "
             "Impute or remove missing values explicitly before transformation."
         )
+
+
+def _validate_output_names(frame: pd.DataFrame, names: Sequence[str]) -> None:
+    """Reject duplicate or already-existing generated feature names."""
+    names = list(names)
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise ValueError(f"Generated feature names contain duplicates: {duplicates}")
+    collisions = [name for name in names if name in frame.columns]
+    if collisions:
+        raise ValueError(
+            f"Generated feature column(s) already exist in DataFrame: {collisions}. "
+            "Choose a different suffix/prefix or remove the existing columns first."
+        )
+
+
+def _validate_finite_numeric(value: Any, name: str) -> float:
+    """Validate and return a finite numeric scalar."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, np.number)):
+        raise TypeError(f"{name} must be numeric.")
+    value = float(value)
+    if not np.isfinite(value):
+        raise ValueError(f"{name} must be finite, got {value!r}")
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +494,8 @@ class NumericScaler:
         self.method = method
         self._scaler = _make_scaler(method)
         self.columns_: list[str] | None = None
+        self.feature_names_in_: tuple[str, ...] | None = None
+        self.feature_names_out_: tuple[str, ...] | None = None
         self.n_features_in_: int | None = None
         self._is_fitted = False
 
@@ -269,6 +507,8 @@ class NumericScaler:
         self._scaler = _make_scaler(self.method)
         self._scaler.fit(frame[self.columns_])
         self.n_features_in_ = len(self.columns_)
+        self.feature_names_in_ = tuple(self.columns_)
+        self.feature_names_out_ = tuple(frame.columns)
         self._is_fitted = True
 
         logger.debug(
@@ -446,6 +686,9 @@ class CategoricalEncoder:
         self._frequency_maps: dict[str, dict[Any, float]] = {}
         self.columns_: list[str] | None = None
         self.feature_names_: list[str] | None = None
+        self.feature_names_in_: tuple[str, ...] | None = None
+        self.feature_names_out_: tuple[str, ...] | None = None
+        self.n_features_in_: int | None = None
         self._is_fitted = False
 
     def fit(
@@ -489,6 +732,11 @@ class CategoricalEncoder:
             }
             self.feature_names_ = list(self.columns_)
 
+        self.feature_names_in_ = tuple(frame.columns)
+        self.feature_names_out_ = tuple(
+            c for c in frame.columns if c not in self.columns_
+        ) + tuple(self.feature_names_)
+        self.n_features_in_ = len(frame.columns)
         self._is_fitted = True
         logger.debug(
             "CategoricalEncoder.fit: method=%s, %d columns", self.method, len(self.columns_)
@@ -690,6 +938,7 @@ class NumericBinner:
             raise NotFittedError("NumericBinner is not fitted. Call 'fit' before 'transform'.")
 
         _validate_columns_exist(frame, [self.column_])
+        _validate_numeric_columns(frame, [self.column_])
         _validate_no_missing(frame, [self.column_])
 
         result = frame.copy(deep=True)
@@ -806,6 +1055,7 @@ class TargetEncoder:
     """
 
     def __init__(self, smoothing: float = 1.0) -> None:
+        smoothing = _validate_finite_numeric(smoothing, "smoothing")
         if smoothing < 0:
             raise ValueError(f"smoothing must be non-negative, got {smoothing}")
         self.smoothing = smoothing
@@ -1106,6 +1356,7 @@ def log_transform(
     if not isinstance(offset, (int, float, np.number)):
         raise TypeError("offset must be numeric.")
 
+    _validate_output_names(frame, [f"{column}{suffix}" for column in columns])
     result = frame.copy(deep=True)
     for column in columns:
         values = pd.to_numeric(result[column], errors="raise") + float(offset)
@@ -1160,6 +1411,7 @@ def sqrt_transform(
     _validate_columns_exist(frame, columns)
     _validate_numeric_columns(frame, columns)
 
+    _validate_output_names(frame, [f"{column}{suffix}" for column in columns])
     result = frame.copy(deep=True)
     for column in columns:
         observed = result[column].dropna()
@@ -1235,6 +1487,7 @@ def power_transform(
     if method not in {"yeo-johnson", "box-cox"}:
         raise ValueError(f"method must be 'yeo-johnson' or 'box-cox', got {method!r}")
 
+    _validate_output_names(frame, [f"{column}_power" for column in columns])
     transformer = PowerTransformer(method=method, standardize=standardize)
     values = transformer.fit_transform(frame[list(columns)])
 
@@ -1474,6 +1727,8 @@ def create_polynomial_features(
     transformer = PolynomialFeatures(degree=degree, include_bias=include_bias)
     values = transformer.fit_transform(frame[list(columns)])
     names = [str(name) for name in transformer.get_feature_names_out(columns)]
+    generated_names = [name for name in names if name not in frame.columns]
+    _validate_output_names(frame, generated_names)
 
     result = frame.copy(deep=True)
     for i, name in enumerate(names):
@@ -1557,6 +1812,10 @@ def add_datetime_features(
     if components is None:
         components = sorted(_DATETIME_COMPONENTS)
     else:
+        components = list(components)
+        if len(components) != len(set(components)):
+            duplicates = sorted({c for c in components if components.count(c) > 1})
+            raise ValueError(f"components contains duplicates: {duplicates}")
         unknown = set(components) - _DATETIME_COMPONENTS
         if unknown:
             raise ValueError(
@@ -1568,6 +1827,7 @@ def add_datetime_features(
     dates = pd.to_datetime(result[column], errors=errors)
     still_missing = dates.isna()
     name = prefix or column
+    _validate_output_names(frame, [f"{name}_{component}" for component in components])
 
     for component in components:
         target_name = f"{name}_{component}"
@@ -1650,11 +1910,13 @@ def add_cyclical_features(
     """
     _validate_columns_exist(frame, [column])
     _validate_numeric_columns(frame, [column])
-    if not isinstance(period, (int, float, np.number)) or float(period) <= 0:
+    period = _validate_finite_numeric(period, "period")
+    if period <= 0:
         raise ValueError(f"period must be a positive number, got {period}")
 
     result = frame.copy(deep=True)
     label = suffix or column
+    _validate_output_names(frame, [f"{label}_sin", f"{label}_cos"])
     angle = 2 * np.pi * result[column] / float(period)
     result[f"{label}_sin"] = np.sin(angle)
     result[f"{label}_cos"] = np.cos(angle)
@@ -1715,6 +1977,7 @@ def add_frequency_features(
       their own frequency (via ``dropna=False``), not dropped.
     """
     _validate_columns_exist(frame, columns)
+    _validate_output_names(frame, [f"{column}{suffix}" for column in columns])
     result = frame.copy(deep=True)
 
     for column in columns:
@@ -1784,8 +2047,11 @@ def low_variance_features(
       distinct values they have.
     """
     numeric_columns = _resolve_numeric_columns(frame, columns)
+    threshold = _validate_finite_numeric(threshold, "threshold")
     if threshold < 0:
         raise ValueError(f"threshold must be >= 0, got {threshold}")
+    if not isinstance(ddof, (int, np.integer)) or isinstance(ddof, bool) or ddof < 0:
+        raise ValueError(f"ddof must be a non-negative integer, got {ddof!r}")
 
     variances = frame[numeric_columns].var(axis=0, ddof=ddof, skipna=True).fillna(0.0)
     return variances[variances <= threshold].index.tolist()
@@ -1877,6 +2143,7 @@ def find_correlated_feature_pairs(
     """
     _validate_dataframe(frame)
 
+    threshold = _validate_finite_numeric(threshold, "threshold")
     if not (0 <= threshold <= 1):
         raise ValueError(f"threshold must be between 0 and 1, got {threshold}")
 

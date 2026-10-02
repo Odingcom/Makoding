@@ -36,6 +36,7 @@ from makoding import (
     eda,
     feature_engineering,
     modeling,
+    statistical_ui,
     styling,
     visualization,
     unsupervised,
@@ -1186,6 +1187,7 @@ st.markdown(
 (
     overview_tab,
     eda_tab,
+    statistical_tab,
     feature_tab,
     model_tab,
     unsupervised_tab,
@@ -1194,6 +1196,7 @@ st.markdown(
     [
         "Overview",
         "EDA",
+        "Statistical Analysis",
         "Feature Engineering",
         "Model Builder",
         "Unsupervised",
@@ -1437,6 +1440,14 @@ with eda_tab:
 
         st.markdown("")
         render_visual_overview(current_dataset)
+
+
+# ============================================================================
+# Statistical analysis
+# ============================================================================
+
+with statistical_tab:
+    statistical_ui.render_statistical_analysis(current_dataset)
 
 
 # ============================================================================

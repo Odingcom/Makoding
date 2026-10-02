@@ -1,14 +1,15 @@
 """Visualization utilities for Makoding.
 
 Matplotlib-based chart generation for univariate analysis, bivariate
-analysis, unsupervised-learning diagnostics, and supervised-model
+analysis, data-quality and cleaning diagnostics, statistical
+diagnostics, unsupervised-learning diagnostics, and supervised-model
 diagnostics. Every function returns a ``matplotlib.figure.Figure`` —
 none of them call ``plt.show()`` — so callers decide how to display
 it: ``st.pyplot(fig)`` in Streamlit, ``fig.savefig(...)`` to a file,
 or direct inspection of ``fig.axes`` in a test.
 
-Four families of plots
-------------------------
+Families of plots
+-----------------
 - **Univariate**: :func:`plot_histogram` / :func:`plot_numeric_distribution`,
   :func:`plot_categorical_counts` (with an optional ``hue`` for
   grouped/stacked counts), :func:`plot_violin`, and the dispatcher
@@ -16,6 +17,16 @@ Four families of plots
 - **Bivariate**: :func:`plot_scatter`, :func:`plot_box_by_group`,
   :func:`plot_category_heatmap`, :func:`plot_pairplot`, and the
   dispatcher :func:`plot_bivariate`.
+- **Data quality and cleaning**: :func:`plot_missingness`,
+  :func:`plot_missing_matrix`, :func:`plot_correlation_heatmap`,
+  :func:`plot_correlation_matrix`, :func:`plot_cleaning_impact`,
+  :func:`plot_outlier_fences`, :func:`plot_before_after`. These pair with
+  :mod:`makoding.cleaning` (``CleaningAudit``, the fences learned by a
+  fitted ``Cleaner``) and :mod:`makoding.eda`.
+- **Statistical diagnostics**: :func:`plot_qq`,
+  :func:`plot_regression_diagnostics`, :func:`plot_time_series`,
+  :func:`plot_forecast`. These pair with the statistical-analysis layer
+  (normality tests, ``ols_regression`` results, ``forecast_arima`` output).
 - **Unsupervised diagnostics**: :func:`plot_pca_scatter`,
   :func:`plot_cluster_scatter`, :func:`plot_elbow`,
   :func:`plot_silhouette_by_k`. These take the DataFrames/arrays
@@ -24,19 +35,29 @@ Four families of plots
   a raw frame and column name.
 - **Supervised model diagnostics**: :func:`plot_confusion_matrix`,
   :func:`plot_roc_curve`, :func:`plot_precision_recall_curve`,
-  :func:`plot_residuals`, :func:`plot_predicted_vs_actual`,
-  :func:`plot_feature_importance`, :func:`plot_cross_validation_scores`.
-  These take ``y_true``/``y_pred``/``y_score`` arrays or a
-  ``Model.cross_validate()``-shaped DataFrame, not a frame and column
-  name.
+  :func:`plot_calibration_curve`, :func:`plot_residuals`,
+  :func:`plot_prediction_error`, :func:`plot_predicted_vs_actual`,
+  :func:`plot_feature_importance`, :func:`plot_cross_validation_scores`,
+  :func:`plot_model_comparison`. These take ``y_true``/``y_pred``/``y_score``
+  arrays or a ``Model.cross_validate()``-shaped DataFrame, not a frame and
+  column name.
 
 Design principles
-------------------
+-----------------
 - Most functions accept an optional ``ax`` (a matplotlib ``Axes``) so
   plots can be composed into a grid; when omitted, a new figure is
   created. Either way, the function returns the owning ``Figure``.
-  :func:`plot_pairplot` is the one exception — it always owns a
-  multi-panel grid, so it does not accept ``ax``.
+  :func:`plot_pairplot`, :func:`plot_before_after` and
+  :func:`plot_regression_diagnostics` are the exceptions — they always own a
+  multi-panel grid, so they do not accept ``ax``.
+- Figures are built with ``matplotlib.figure.Figure`` directly rather than
+  through ``pyplot``, so they are never registered in pyplot's global
+  figure registry. A figure that a caller forgets to close is simply
+  garbage-collected; it cannot accumulate across Streamlit reruns and
+  trigger matplotlib's "more than 20 figures" warning. (Calling
+  ``plt.close(fig)`` on one of these figures is harmless.)
+- Colours come from :mod:`makoding.palette`, the same tokens the Streamlit
+  theme uses, so charts match the page they are embedded in.
 - Functions validate input and raise typed errors (``TypeError``,
   ``ValueError``, ``KeyError``), matching the rest of this package.
 - Nothing here mutates a caller's DataFrame or array.
@@ -55,12 +76,14 @@ import matplotlib
 
 matplotlib.use("Agg")  # headless backend: safe on servers, CI, and tests
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.axes import Axes
+from matplotlib.colors import LinearSegmentedColormap, ListedColormap
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+from scipy import stats
 from sklearn.metrics import (
     ConfusionMatrixDisplay,
     PrecisionRecallDisplay,
@@ -68,9 +91,22 @@ from sklearn.metrics import (
 )
 
 from .feature_engineering import (
+    _resolve_numeric_columns,
     _validate_columns_exist,
     _validate_dataframe,
     _validate_numeric_columns,
+)
+from .palette import (
+    ACCENT,
+    BORDER,
+    CATEGORICAL,
+    INK,
+    MUTED,
+    NAVY,
+    TEAL,
+    TEAL_DARK,
+    TEAL_LIGHT,
+    WHITE,
 )
 
 __all__ = [
@@ -86,6 +122,19 @@ __all__ = [
     "plot_category_heatmap",
     "plot_pairplot",
     "plot_bivariate",
+    # Data quality and cleaning
+    "plot_missingness",
+    "plot_missing_matrix",
+    "plot_correlation_heatmap",
+    "plot_correlation_matrix",
+    "plot_cleaning_impact",
+    "plot_outlier_fences",
+    "plot_before_after",
+    # Statistical diagnostics
+    "plot_qq",
+    "plot_regression_diagnostics",
+    "plot_time_series",
+    "plot_forecast",
     # Unsupervised diagnostics
     "plot_pca_scatter",
     "plot_cluster_scatter",
@@ -95,30 +144,143 @@ __all__ = [
     "plot_confusion_matrix",
     "plot_roc_curve",
     "plot_precision_recall_curve",
+    "plot_calibration_curve",
     "plot_residuals",
+    "plot_prediction_error",
     "plot_predicted_vs_actual",
     "plot_feature_importance",
     "plot_cross_validation_scores",
+    "plot_model_comparison",
 ]
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
 _DEFAULT_FIGSIZE = (8, 5)
-_TAB10 = plt.get_cmap("tab10")
+_PRIMARY = TEAL
+_ANNOTATION_LIMIT = 25  # correlation cells are annotated up to this many columns
+
+_SEQUENTIAL = LinearSegmentedColormap.from_list("datalab_sequential", [WHITE, TEAL])
+_DIVERGING = LinearSegmentedColormap.from_list("datalab_diverging", [ACCENT, WHITE, TEAL])
+_POINTS = LinearSegmentedColormap.from_list("datalab_points", ["#9EC8D4", NAVY])
+_BINARY = ListedColormap([TEAL_LIGHT, ACCENT])
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _cat(index: int) -> str:
+    """Return the ``index``-th categorical colour, cycling if needed."""
+    return CATEGORICAL[index % len(CATEGORICAL)]
+
+
 def _get_figure_and_axes(ax: Axes | None, figsize: tuple[float, float]) -> tuple[Figure, Axes]:
-    """Return ``(figure, axes)``, creating a new figure only if ``ax`` is ``None``."""
+    """Return ``(figure, axes)``, creating a new figure only if ``ax`` is ``None``.
+
+    New figures are created with ``Figure`` directly (not ``pyplot``) so they
+    are never held in pyplot's global registry.
+    """
     if ax is None:
-        fig, ax = plt.subplots(figsize=figsize)
+        fig = Figure(figsize=figsize, facecolor=WHITE)
+        ax = fig.subplots()
     else:
         fig = ax.figure
     return fig, ax
+
+
+def _style_axes(ax: Axes, label_size: float = 9) -> None:
+    """Apply the design-system look to one axes (no-op for colorbar axes)."""
+    if ax.get_label() == "<colorbar>":
+        ax.tick_params(colors=MUTED, labelsize=label_size)
+        return
+
+    ax.set_facecolor(WHITE)
+    for name in ("top", "right"):
+        spine = ax.spines.get(name)
+        if spine is not None and not ax.images:
+            spine.set_visible(False)
+    for spine in ax.spines.values():
+        spine.set_color(BORDER)
+    ax.tick_params(colors=MUTED, labelsize=label_size)
+    ax.xaxis.label.set_color(INK)
+    ax.yaxis.label.set_color(INK)
+
+    title = ax.get_title()
+    if title:
+        ax.set_title(
+            title,
+            loc="center",
+            fontsize=12,
+            fontweight="bold",
+            color=NAVY,
+            pad=10,
+        )
+
+    for line in ax.get_xgridlines() + ax.get_ygridlines():
+        line.set_color(BORDER)
+
+
+def _finalize(fig: Figure, label_size: float = 9) -> Figure:
+    """Style every axes, lay the figure out, and return it."""
+    for axes in fig.axes:
+        _style_axes(axes, label_size=label_size)
+    fig.tight_layout()
+    return fig
+
+
+def _boxplot(ax: Axes, data: Sequence[Any], labels: Sequence[str]) -> Any:
+    """Draw a themed box plot, tolerating the ``labels`` -> ``tick_labels`` rename.
+
+    Matplotlib 3.9 renamed ``boxplot``'s ``labels`` argument to ``tick_labels``
+    (``labels`` was later deprecated); trying the new name first and falling
+    back keeps this working on both sides of that change.
+    """
+    style = dict(
+        patch_artist=True,
+        boxprops=dict(facecolor=TEAL_LIGHT, edgecolor=TEAL),
+        medianprops=dict(color=ACCENT, linewidth=2),
+        whiskerprops=dict(color=TEAL),
+        capprops=dict(color=TEAL),
+        flierprops=dict(marker="o", markersize=3, markerfacecolor="none", markeredgecolor=MUTED),
+    )
+    try:
+        return ax.boxplot(data, tick_labels=labels, **style)
+    except TypeError:
+        return ax.boxplot(data, labels=labels, **style)
+
+
+def _style_violin(parts: dict[str, Any]) -> None:
+    for body in parts["bodies"]:
+        body.set_facecolor(_PRIMARY)
+        body.set_edgecolor(TEAL_DARK)
+        body.set_alpha(0.55)
+    for key in ("cmeans", "cmedians"):
+        if key in parts:
+            parts[key].set_color(ACCENT)
+    for key in ("cbars", "cmins", "cmaxes"):
+        if key in parts:
+            parts[key].set_color(TEAL_DARK)
+
+
+def _note_axes(ax: Axes, message: str) -> None:
+    """Replace an empty plot area with a centred explanatory message."""
+    ax.text(
+        0.5, 0.5, message, ha="center", va="center",
+        color=MUTED, fontsize=11, transform=ax.transAxes,
+    )
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+
+def _int_attr(obj: Any, name: str) -> int:
+    """Read an integer attribute defensively (missing/None/garbage -> 0)."""
+    try:
+        return int(getattr(obj, name, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _validate_array_pair(y_true: Sequence[Any], y_pred: Sequence[Any], names: tuple[str, str]) -> None:
@@ -131,6 +293,20 @@ def _validate_array_pair(y_true: Sequence[Any], y_pred: Sequence[Any], names: tu
             f"{name_a} and {name_b} must have the same length, "
             f"got {len(y_true)} and {len(y_pred)}"
         )
+
+
+def _validate_numeric_array(values: Sequence[Any], *, name: str) -> np.ndarray:
+    """Return a finite 1-D float array, or raise; never silently drops values."""
+    array = np.asarray(values)
+    if array.ndim != 1 or array.size == 0:
+        raise ValueError(f"{name} must be a non-empty one-dimensional array.")
+    try:
+        numeric = array.astype(float)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"{name} must contain numeric values.") from exc
+    if not np.isfinite(numeric).all():
+        raise ValueError(f"{name} contains missing or non-finite values.")
+    return numeric
 
 
 def _plot_scatter_by_group(
@@ -162,7 +338,7 @@ def _plot_scatter_by_group(
         mask = (grouped == group).to_numpy()
         ax.scatter(
             x_array[mask], y_array[mask],
-            alpha=0.6, edgecolor="none", color=_TAB10(index % 10), label=group,
+            alpha=0.6, edgecolor="none", color=_cat(index), label=group,
         )
     ax.legend(title=legend_title, fontsize=8, loc="best")
 
@@ -230,7 +406,7 @@ def plot_numeric_distribution(
         raise ValueError(f"Column {column!r} has no observed (non-missing) values to plot")
 
     fig, ax = _get_figure_and_axes(ax, _DEFAULT_FIGSIZE)
-    ax.hist(values, bins=bins, color="#4C72B0", edgecolor="white", alpha=0.85)
+    ax.hist(values, bins=bins, color=_PRIMARY, edgecolor="white", alpha=0.85)
     ax.set_xlabel(column)
     ax.set_ylabel("Count")
     ax.set_title(f"Distribution of {column}")
@@ -244,12 +420,11 @@ def plot_numeric_distribution(
         density = kde_estimator(x_grid)
 
         kde_ax = ax.twinx()
-        kde_ax.plot(x_grid, density, color="#C44E52", linewidth=2)
+        kde_ax.plot(x_grid, density, color=ACCENT, linewidth=2)
         kde_ax.set_ylabel("Density")
         kde_ax.set_yticks([])
 
-    fig.tight_layout()
-    return fig
+    return _finalize(fig)
 
 
 def plot_histogram(
@@ -349,15 +524,14 @@ def plot_categorical_counts(
 
         fig, ax = _get_figure_and_axes(ax, _DEFAULT_FIGSIZE)
         labels = [str(v) for v in counts.index]
-        ax.bar(labels, counts.values, color="#4C72B0", edgecolor="white", alpha=0.85)
+        ax.bar(labels, counts.values, color=_PRIMARY, edgecolor="white", alpha=0.85)
         ax.set_xlabel(column)
         ax.set_ylabel("Count")
         ax.set_title(f"Counts of {column}")
         ax.grid(axis="y", alpha=0.3)
         ax.set_xticks(range(len(labels)))
         ax.set_xticklabels(labels, rotation=45, ha="right")
-        fig.tight_layout()
-        return fig
+        return _finalize(fig)
 
     _validate_columns_exist(frame, [column, hue])
     working = frame[[column, hue]].dropna()
@@ -388,7 +562,7 @@ def plot_categorical_counts(
         bottom = np.zeros(len(crosstab.index))
         for index, hue_value in enumerate(hue_categories):
             values = crosstab[hue_value].to_numpy()
-            ax.bar(x_positions, values, bottom=bottom, color=_TAB10(index % 10), label=str(hue_value))
+            ax.bar(x_positions, values, bottom=bottom, color=_cat(index), label=str(hue_value))
             bottom = bottom + values
     else:
         width = 0.8 / max(len(hue_categories), 1)
@@ -396,7 +570,7 @@ def plot_categorical_counts(
             offset = (index - (len(hue_categories) - 1) / 2) * width
             ax.bar(
                 x_positions + offset, crosstab[hue_value].to_numpy(), width=width,
-                color=_TAB10(index % 10), label=str(hue_value),
+                color=_cat(index), label=str(hue_value),
             )
 
     ax.set_xticks(x_positions)
@@ -406,8 +580,7 @@ def plot_categorical_counts(
     ax.set_title(f"Counts of {column} by {hue}")
     ax.grid(axis="y", alpha=0.3)
     ax.legend(title=hue, fontsize=8, loc="best")
-    fig.tight_layout()
-    return fig
+    return _finalize(fig)
 
 
 def plot_violin(
@@ -473,7 +646,8 @@ def plot_violin(
             raise ValueError(f"Column {numeric_column!r} has no observed (non-missing) values to plot")
 
         fig, ax = _get_figure_and_axes(ax, _DEFAULT_FIGSIZE)
-        ax.violinplot([values.to_numpy()], showmeans=True, showmedians=True)
+        parts = ax.violinplot([values.to_numpy()], showmeans=True, showmedians=True)
+        _style_violin(parts)
         ax.set_xticks([1])
         ax.set_xticklabels([numeric_column])
         ax.set_ylabel(numeric_column)
@@ -494,7 +668,8 @@ def plot_violin(
         labels = [str(g) for g in kept_groups]
 
         fig, ax = _get_figure_and_axes(ax, _DEFAULT_FIGSIZE)
-        ax.violinplot(data, showmeans=True, showmedians=True)
+        parts = ax.violinplot(data, showmeans=True, showmedians=True)
+        _style_violin(parts)
         ax.set_xticks(range(1, len(labels) + 1))
         ax.set_xticklabels(labels, rotation=45, ha="right")
         ax.set_ylabel(numeric_column)
@@ -502,8 +677,7 @@ def plot_violin(
         ax.set_title(f"{numeric_column} by {group_column}")
 
     ax.grid(axis="y", alpha=0.3)
-    fig.tight_layout()
-    return fig
+    return _finalize(fig)
 
 
 def plot_univariate(frame: pd.DataFrame, column: str, ax: Axes | None = None, **kwargs: Any) -> Figure:
@@ -619,11 +793,11 @@ def plot_scatter(
     fig, ax = _get_figure_and_axes(ax, _DEFAULT_FIGSIZE)
 
     if hue is None:
-        ax.scatter(working[x], working[y], color="#4C72B0", alpha=0.6, edgecolor="none")
+        ax.scatter(working[x], working[y], color=_PRIMARY, alpha=0.6, edgecolor="none")
     elif pd.api.types.is_numeric_dtype(working[hue]):
         working = working.dropna(subset=[hue])
         scatter = ax.scatter(
-            working[x], working[y], c=working[hue], cmap="viridis", alpha=0.7, edgecolor="none"
+            working[x], working[y], c=working[hue], cmap=_POINTS, alpha=0.8, edgecolor="none"
         )
         fig.colorbar(scatter, ax=ax, label=hue)
     else:
@@ -636,8 +810,7 @@ def plot_scatter(
     ax.set_ylabel(y)
     ax.set_title(f"{x} vs {y}")
     ax.grid(alpha=0.3)
-    fig.tight_layout()
-    return fig
+    return _finalize(fig)
 
 
 def plot_box_by_group(
@@ -710,14 +883,13 @@ def plot_box_by_group(
     labels = [str(g) for g in kept_groups]
 
     fig, ax = _get_figure_and_axes(ax, _DEFAULT_FIGSIZE)
-    ax.boxplot(data, tick_labels=labels)
+    _boxplot(ax, data, labels)
     ax.set_xlabel(group_column)
     ax.set_ylabel(numeric_column)
     ax.set_title(f"{numeric_column} by {group_column}")
     ax.grid(axis="y", alpha=0.3)
     ax.set_xticklabels(labels, rotation=45, ha="right")
-    fig.tight_layout()
-    return fig
+    return _finalize(fig)
 
 
 def plot_category_heatmap(
@@ -777,7 +949,7 @@ def plot_category_heatmap(
 
     figsize = (max(6, 0.5 * len(crosstab.columns) + 2), max(5, 0.5 * len(crosstab.index) + 2))
     fig, ax = _get_figure_and_axes(ax, figsize)
-    image = ax.imshow(crosstab.values, cmap="Blues", aspect="auto")
+    image = ax.imshow(crosstab.values, cmap=_SEQUENTIAL, aspect="auto")
     ax.set_xticks(range(len(crosstab.columns)))
     ax.set_xticklabels([str(c) for c in crosstab.columns], rotation=45, ha="right")
     ax.set_yticks(range(len(crosstab.index)))
@@ -786,8 +958,7 @@ def plot_category_heatmap(
     ax.set_ylabel(column_a)
     ax.set_title(f"{column_a} vs {column_b}")
     fig.colorbar(image, ax=ax, label="Count")
-    fig.tight_layout()
-    return fig
+    return _finalize(fig)
 
 
 def plot_pairplot(
@@ -840,7 +1011,7 @@ def plot_pairplot(
     -----------
     - This function does **not** accept ``ax`` — it always creates
       and owns an ``n x n`` grid of axes as a new figure, unlike
-      every other plotting function in this module.
+      most other plotting functions in this module.
     - A row missing any of the plotted ``columns`` is dropped from
       every panel (not just the ones involving the missing value),
       so all panels represent exactly the same set of rows.
@@ -883,26 +1054,27 @@ def plot_pairplot(
         unique_groups = sorted(hue_groups.unique())
 
     n = len(columns)
-    fig, axes = plt.subplots(n, n, figsize=(2.3 * n, 2.3 * n))
+    fig = Figure(figsize=(2.3 * n, 2.3 * n), facecolor=WHITE)
+    axes = fig.subplots(n, n)
 
     for row_index, row_column in enumerate(columns):
         for col_index, col_column in enumerate(columns):
             panel = axes[row_index, col_index]
 
             if row_index == col_index:
-                panel.hist(working[row_column], bins=15, color="#4C72B0", alpha=0.85)
+                panel.hist(working[row_column], bins=15, color=_PRIMARY, alpha=0.85)
             elif hue:
                 for group_index, group in enumerate(unique_groups):
                     mask = (hue_groups == group).to_numpy()
                     panel.scatter(
                         working[col_column].to_numpy()[mask],
                         working[row_column].to_numpy()[mask],
-                        s=10, alpha=0.6, color=_TAB10(group_index % 10), edgecolor="none",
+                        s=10, alpha=0.6, color=_cat(group_index), edgecolor="none",
                     )
             else:
                 panel.scatter(
                     working[col_column], working[row_column], s=10, alpha=0.5,
-                    color="#4C72B0", edgecolor="none",
+                    color=_PRIMARY, edgecolor="none",
                 )
 
             if row_index == n - 1:
@@ -913,18 +1085,16 @@ def plot_pairplot(
                 panel.set_ylabel(row_column, fontsize=8)
             else:
                 panel.set_yticklabels([])
-            panel.tick_params(labelsize=7)
 
     if hue:
         legend_handles = [
-            Line2D([0], [0], marker="o", color="w", markerfacecolor=_TAB10(i % 10), label=group, markersize=6)
+            Line2D([0], [0], marker="o", color="w", markerfacecolor=_cat(i), label=group, markersize=6)
             for i, group in enumerate(unique_groups)
         ]
         fig.legend(handles=legend_handles, title=hue, loc="upper right", fontsize=8)
 
-    fig.suptitle("Pairwise relationships")
-    fig.tight_layout()
-    return fig
+    fig.suptitle("Pairwise relationships", color=NAVY, fontweight="bold")
+    return _finalize(fig, label_size=7)
 
 
 def plot_bivariate(frame: pd.DataFrame, x: str, y: str, ax: Axes | None = None, **kwargs: Any) -> Figure:
@@ -972,6 +1142,854 @@ def plot_bivariate(frame: pd.DataFrame, x: str, y: str, ax: Axes | None = None, 
     if y_numeric and not x_numeric:
         return plot_box_by_group(frame, y, x, ax=ax, **kwargs)
     return plot_category_heatmap(frame, x, y, ax=ax, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Data quality and cleaning
+# ---------------------------------------------------------------------------
+
+def plot_missingness(
+    frame: pd.DataFrame,
+    *,
+    top_n: int | None = 20,
+    percentage: bool = True,
+    ax: Axes | None = None,
+) -> Figure:
+    """Plot missing-value counts by column, sorted from highest to lowest.
+
+    Parameters
+    ----------
+    frame:
+        Input pandas DataFrame.
+    top_n:
+        Maximum number of columns shown (those with the most missing
+        values), or ``None`` for every column that has any.
+    percentage:
+        If ``True`` (default) the bars show percent of rows missing;
+        if ``False``, raw counts.
+    ax:
+        Existing matplotlib ``Axes`` to draw on.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+
+    Raises
+    ------
+    TypeError
+        If ``frame`` is not a DataFrame.
+    ValueError
+        If ``frame`` has no rows, or ``top_n`` is less than 1.
+
+    Assumptions
+    -----------
+    - Only columns with at least one missing value are drawn; a frame
+      with no missing values produces a figure carrying a "No missing
+      values" note rather than an axis of zero-length bars or an error,
+      since "nothing is missing" is a valid, useful answer for a
+      data-quality chart.
+    - Only ``NaN``/``None``/``NaT`` count as missing; empty strings and
+      placeholder values (``"N/A"``, ``-999``) do not.
+    """
+    _validate_dataframe(frame)
+    if frame.empty:
+        raise ValueError("frame is empty.")
+    if top_n is not None and top_n < 1:
+        raise ValueError("top_n must be >= 1 or None.")
+
+    counts = frame.isna().sum()
+    counts = counts[counts > 0].sort_values(ascending=False)
+    total_with_missing = len(counts)
+    if top_n is not None:
+        counts = counts.head(top_n)
+
+    height = max(3.0, 0.38 * max(len(counts), 1) + 1.6)
+    fig, ax = _get_figure_and_axes(ax, (9, height))
+    ax.set_title("Missingness by column")
+
+    if counts.empty:
+        _note_axes(ax, "No missing values")
+        return _finalize(fig)
+
+    values = counts / len(frame) * 100 if percentage else counts.astype(float)
+    shown = pd.DataFrame(
+        {"column": counts.index.astype(str), "value": values.to_numpy(), "count": counts.to_numpy()}
+    ).iloc[::-1]
+
+    bars = ax.barh(shown["column"], shown["value"], color=_PRIMARY, edgecolor="none")
+    if percentage:
+        labels = [f"{v:.1f}%  ({n:,})" for v, n in zip(shown["value"], shown["count"])]
+        ax.set_xlabel("Missing observations (%)")
+    else:
+        labels = [f"{int(n):,}" for n in shown["count"]]
+        ax.set_xlabel("Missing observations")
+    ax.bar_label(bars, labels=labels, padding=4, fontsize=8, color=MUTED)
+    ax.set_xlim(0, max(float(shown["value"].max()) * 1.3, 1.0))
+    ax.grid(axis="x", alpha=0.3)
+    if top_n is not None and total_with_missing > top_n:
+        ax.set_ylabel(f"Top {top_n} of {total_with_missing} columns with missing values")
+    return _finalize(fig)
+
+
+def plot_missing_matrix(
+    frame: pd.DataFrame,
+    max_rows: int = 200,
+    max_columns: int = 40,
+    ax: Axes | None = None,
+) -> Figure:
+    """Plot where values are missing, as a rows-by-columns pattern.
+
+    Unlike :func:`plot_missingness` (how much is missing per column), this
+    shows *which rows* — so you can see whether missing values cluster
+    together, e.g. one upstream source failing for a stretch of rows.
+
+    Parameters
+    ----------
+    frame:
+        Input pandas DataFrame.
+    max_rows:
+        Maximum rows drawn. Larger frames are sampled at evenly spaced
+        row positions (deterministic, keeps original order).
+    max_columns:
+        Maximum columns drawn, keeping those with the most missing values.
+    ax:
+        Existing matplotlib ``Axes`` to draw on.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+
+    Raises
+    ------
+    TypeError
+        If ``frame`` is not a DataFrame.
+    ValueError
+        If ``frame`` has no rows, or ``max_rows``/``max_columns`` is less than 1.
+
+    Assumptions
+    -----------
+    - Only columns with at least one missing value are drawn; if there are
+      none, the figure carries a "No missing values" note.
+    - Row sampling is by position, not random, so the picture is
+      reproducible; short missing runs between sampled positions can be
+      missed on very tall frames. The y-axis label says when sampling
+      occurred.
+    """
+    _validate_dataframe(frame)
+    if frame.empty:
+        raise ValueError("frame is empty.")
+    if max_rows < 1 or max_columns < 1:
+        raise ValueError("max_rows and max_columns must be >= 1.")
+
+    counts = frame.isna().sum()
+    with_missing = counts[counts > 0].sort_values(ascending=False)
+
+    fig, ax = _get_figure_and_axes(ax, (9, 5))
+    ax.set_title("Missing-value pattern")
+
+    if with_missing.empty:
+        _note_axes(ax, "No missing values")
+        return _finalize(fig)
+
+    columns = with_missing.index[:max_columns]
+    data = frame[columns]
+    sampled = len(data) > max_rows
+    if sampled:
+        positions = np.linspace(0, len(data) - 1, max_rows).astype(int)
+        data = data.iloc[positions]
+
+    matrix = data.isna().to_numpy(dtype=int)
+    ax.imshow(matrix, aspect="auto", interpolation="nearest", cmap=_BINARY, vmin=0, vmax=1)
+    ax.set_xticks(range(len(columns)))
+    ax.set_xticklabels([str(c) for c in columns], rotation=90, fontsize=8)
+    ax.set_yticks([])
+    ax.set_ylabel("Rows (evenly sampled)" if sampled else "Rows")
+    ax.legend(
+        handles=[Patch(facecolor=TEAL_LIGHT, label="Present"), Patch(facecolor=ACCENT, label="Missing")],
+        loc="upper right", fontsize=8, framealpha=1,
+    )
+    return _finalize(fig)
+
+
+def plot_correlation_matrix(
+    corr: pd.DataFrame,
+    annotate: bool | None = None,
+    title: str = "Correlation matrix",
+    ax: Axes | None = None,
+) -> Figure:
+    """Plot an already-computed correlation matrix as a heatmap.
+
+    Designed for ``makoding.eda.correlation_matrix(...)`` output. To compute
+    the correlations from raw data in the same call, use
+    :func:`plot_correlation_heatmap`.
+
+    Parameters
+    ----------
+    corr:
+        A square DataFrame of correlation coefficients in ``[-1, 1]``.
+    annotate:
+        Write each coefficient in its cell. ``None`` (default) annotates
+        automatically when there are 25 or fewer columns.
+    title:
+        Plot title.
+    ax:
+        Existing matplotlib ``Axes`` to draw on.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+
+    Raises
+    ------
+    TypeError
+        If ``corr`` is not a DataFrame.
+    ValueError
+        If ``corr`` is empty or not square.
+
+    Assumptions
+    -----------
+    - The colour scale is fixed to ``[-1, 1]`` and diverging around zero
+      (warm = negative, teal = positive), so plots from different datasets
+      are directly comparable; values are not rescaled to the data's range.
+    - ``NaN`` coefficients (e.g. a constant column) are left blank, not
+      drawn as zero.
+    - Nothing checks that ``corr`` is symmetric or in range — it is drawn
+      as given.
+    """
+    _validate_dataframe(corr)
+    if corr.empty:
+        raise ValueError("corr is empty.")
+    if corr.shape[0] != corr.shape[1]:
+        raise ValueError("corr must be a square correlation matrix.")
+
+    n = corr.shape[0]
+    values = corr.to_numpy(dtype=float)
+    if annotate is None:
+        annotate = n <= _ANNOTATION_LIMIT
+
+    size = max(5.5, 0.5 * n + 2.5)
+    fig, ax = _get_figure_and_axes(ax, (size * 1.1, size))
+    image = ax.imshow(np.ma.masked_invalid(values), cmap=_DIVERGING, vmin=-1, vmax=1, aspect="auto")
+    ax.set_xticks(range(n))
+    ax.set_xticklabels([str(c) for c in corr.columns], rotation=60, ha="right")
+    ax.set_yticks(range(n))
+    ax.set_yticklabels([str(i) for i in corr.index])
+
+    if annotate and n <= _ANNOTATION_LIMIT:
+        for row in range(n):
+            for col in range(n):
+                value = values[row, col]
+                if np.isfinite(value):
+                    ax.text(
+                        col, row, f"{value:.2f}", ha="center", va="center", fontsize=7,
+                        color=WHITE if abs(value) > 0.65 else INK,
+                    )
+
+    ax.set_title(title)
+    fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04, label="Correlation")
+    return _finalize(fig)
+
+
+def plot_correlation_heatmap(
+    frame: pd.DataFrame,
+    columns: Sequence[str] | None = None,
+    *,
+    method: str = "pearson",
+    annotate: bool | None = True,
+    ax: Axes | None = None,
+) -> Figure:
+    """Compute and plot a numeric correlation heatmap.
+
+    Parameters
+    ----------
+    frame:
+        Input pandas DataFrame.
+    columns:
+        Numeric columns to include. Defaults to every numeric column.
+    method:
+        ``"pearson"``, ``"spearman"``, or ``"kendall"``.
+    annotate:
+        Write each coefficient in its cell (up to 25 columns). ``None``
+        decides automatically.
+    ax:
+        Existing matplotlib ``Axes`` to draw on.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+
+    Raises
+    ------
+    TypeError
+        If ``frame`` is not a DataFrame, or a requested column is not numeric.
+    KeyError
+        If a requested column does not exist.
+    ValueError
+        If ``method`` is unsupported, or fewer than two numeric columns are
+        available.
+
+    Assumptions
+    -----------
+    - Correlations use pairwise-complete observations (pandas' default), so
+      different cells can rest on different numbers of rows.
+    - See :func:`plot_correlation_matrix` for how colours, ``NaN`` cells and
+      annotation are handled.
+    """
+    _validate_dataframe(frame)
+    if method not in {"pearson", "spearman", "kendall"}:
+        raise ValueError("method must be 'pearson', 'spearman', or 'kendall'.")
+
+    numeric = _resolve_numeric_columns(frame, columns)
+    if len(numeric) < 2:
+        raise ValueError("At least two numeric columns are required for a correlation heatmap.")
+
+    correlation = frame[numeric].corr(method=method)
+    return plot_correlation_matrix(
+        correlation, annotate=annotate, title=f"{method.title()} correlation", ax=ax
+    )
+
+
+def plot_cleaning_impact(audit: Any, ax: Axes | None = None) -> Figure:
+    """Plot how much each cleaning step changed, from a ``CleaningAudit``.
+
+    Parameters
+    ----------
+    audit:
+        A ``makoding.cleaning.CleaningAudit`` (or any object with the same
+        attributes). Read defensively: missing attributes count as zero.
+    ax:
+        Existing matplotlib ``Axes`` to draw on.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+
+    Assumptions
+    -----------
+    - Shows counts of *changes*, not data quality: a large "values filled"
+      bar means cleaning did a lot, not that the result is good.
+    - "Rows dropped (missing values)" is derived as
+      ``rows_before - rows_after - duplicates_removed`` and is omitted when
+      not positive.
+    - If cleaning changed nothing, the figure carries a "Cleaning made no
+      changes" note instead of an empty chart.
+    """
+    dropped_rows = max(
+        _int_attr(audit, "rows_before") - _int_attr(audit, "rows_after")
+        - _int_attr(audit, "duplicates_removed"),
+        0,
+    )
+    items = [
+        ("Whitespace trimmed", _int_attr(audit, "whitespace_trimmed")),
+        ("Infinite values replaced", _int_attr(audit, "infinite_replaced")),
+        ("Duplicate rows removed", _int_attr(audit, "duplicates_removed")),
+        ("Rows dropped (missing values)", dropped_rows),
+        ("Missing values filled", _int_attr(audit, "values_filled")),
+        ("Outliers capped", _int_attr(audit, "values_capped")),
+        ("Columns dropped", len(getattr(audit, "columns_dropped", ()) or ())),
+    ]
+
+    fig, ax = _get_figure_and_axes(ax, (8, 4.2))
+    ax.set_title("What cleaning changed")
+
+    if not any(count for _, count in items):
+        _note_axes(ax, "Cleaning made no changes")
+        return _finalize(fig)
+
+    labels = [name for name, _ in items][::-1]
+    counts = [count for _, count in items][::-1]
+    bars = ax.barh(labels, counts, color=_PRIMARY, edgecolor="none")
+    ax.bar_label(bars, labels=[f"{c:,}" for c in counts], padding=4, fontsize=8, color=MUTED)
+    ax.set_xlim(0, max(max(counts) * 1.2, 1))
+    ax.set_xlabel("Count")
+    ax.grid(axis="x", alpha=0.3)
+    return _finalize(fig)
+
+
+def plot_outlier_fences(
+    frame: pd.DataFrame,
+    column: str,
+    lower_fence: float | None = None,
+    upper_fence: float | None = None,
+    multiplier: float = 1.5,
+    bins: int = 30,
+    ax: Axes | None = None,
+) -> Figure:
+    """Plot a histogram with outlier fences and the regions beyond them shaded.
+
+    Pair with the fences a fitted ``Cleaner`` learned from training data
+    (``cleaner.learned_state[column].lower_fence`` / ``.upper_fence``) to see
+    exactly which values ``cap_outliers`` will clip.
+
+    Parameters
+    ----------
+    frame:
+        Input pandas DataFrame.
+    column:
+        Numeric column to plot.
+    lower_fence, upper_fence:
+        Fence positions. If **both** are ``None``, Tukey fences are computed
+        from ``column`` itself as ``Q1 - multiplier*IQR`` / ``Q3 + multiplier*IQR``.
+        If only one is given, only that one is drawn.
+    multiplier:
+        IQR multiplier for the computed fences. Ignored when fences are given.
+    bins:
+        Number of histogram bins.
+    ax:
+        Existing matplotlib ``Axes`` to draw on.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+
+    Raises
+    ------
+    TypeError
+        If ``frame`` is not a DataFrame or ``column`` is not numeric.
+    KeyError
+        If ``column`` does not exist.
+    ValueError
+        If ``column`` has no finite values, ``multiplier`` is not positive and
+        finite, or a supplied fence is not finite.
+
+    Assumptions
+    -----------
+    - Missing and infinite values are dropped before plotting (as with
+      :func:`plot_numeric_distribution`).
+    - Computed fences use this frame's own quartiles. That is right for
+      exploring one dataset, but for judging a *validation/test* frame
+      against a training-time rule, pass the training fences explicitly —
+      computing them from the frame being judged would recreate exactly the
+      leakage a fitted ``Cleaner`` avoids.
+    - A column with IQR of zero yields fences equal to the quartiles, so
+      nearly every distinct value falls outside them.
+    """
+    _validate_columns_exist(frame, [column])
+    _validate_numeric_columns(frame, [column])
+
+    values = pd.to_numeric(frame[column], errors="raise").astype("float64")
+    values = values.replace([np.inf, -np.inf], np.nan).dropna()
+    if values.empty:
+        raise ValueError(f"Column {column!r} has no finite values to plot")
+
+    for name, fence in (("lower_fence", lower_fence), ("upper_fence", upper_fence)):
+        if fence is not None and not np.isfinite(float(fence)):
+            raise ValueError(f"{name} must be finite.")
+
+    if lower_fence is None and upper_fence is None:
+        if not np.isfinite(multiplier) or multiplier <= 0:
+            raise ValueError("multiplier must be positive and finite.")
+        q1, q3 = values.quantile([0.25, 0.75])
+        iqr = q3 - q1
+        lower_fence = float(q1 - multiplier * iqr)
+        upper_fence = float(q3 + multiplier * iqr)
+
+    fig, ax = _get_figure_and_axes(ax, _DEFAULT_FIGSIZE)
+    ax.hist(values, bins=bins, color=_PRIMARY, edgecolor="white", alpha=0.85)
+
+    if lower_fence is not None:
+        below = int((values < float(lower_fence)).sum())
+        ax.axvline(float(lower_fence), color=ACCENT, linestyle="--", linewidth=1.5,
+                   label=f"Lower fence ({below:,} below)")
+        ax.axvspan(min(float(values.min()), float(lower_fence)), float(lower_fence),
+                   color=ACCENT, alpha=0.10)
+    if upper_fence is not None:
+        above = int((values > float(upper_fence)).sum())
+        ax.axvline(float(upper_fence), color=ACCENT, linestyle="--", linewidth=1.5,
+                   label=f"Upper fence ({above:,} above)")
+        ax.axvspan(float(upper_fence), max(float(values.max()), float(upper_fence)),
+                   color=ACCENT, alpha=0.10)
+
+    ax.set_xlabel(column)
+    ax.set_ylabel("Count")
+    ax.set_title(f"Outlier fences for {column}")
+    ax.grid(axis="y", alpha=0.3)
+    ax.legend(fontsize=8, loc="best")
+    return _finalize(fig)
+
+
+def plot_before_after(
+    before: pd.DataFrame,
+    after: pd.DataFrame,
+    column: str,
+    bins: int = 30,
+    labels: tuple[str, str] = ("Before", "After"),
+) -> Figure:
+    """Plot one column's distribution before and after a transformation, side by side.
+
+    Useful for showing the effect of cleaning (outlier capping, filling) or a
+    scaler/power transform on the same column.
+
+    Parameters
+    ----------
+    before, after:
+        DataFrames that both contain ``column`` (typically the raw and the
+        cleaned/transformed frame).
+    column:
+        Numeric column to compare.
+    bins:
+        Histogram bins per panel.
+    labels:
+        Panel titles.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+
+    Raises
+    ------
+    TypeError
+        If either frame is not a DataFrame or ``column`` is not numeric in both.
+    KeyError
+        If ``column`` is missing from either frame.
+    ValueError
+        If either frame has no finite values in ``column``.
+
+    Assumptions
+    -----------
+    - The two panels have **independent** x-axes: a scaler changes the value
+      range, so a shared axis would squash one panel. Compare shape, not
+      position.
+    - Missing/infinite values are dropped from each panel, and each panel's
+      title states its own row count so drops are visible.
+    - This function owns a two-panel figure and does not accept ``ax``.
+    """
+    for frame in (before, after):
+        _validate_columns_exist(frame, [column])
+        _validate_numeric_columns(frame, [column])
+
+    def _clean(frame: pd.DataFrame) -> pd.Series:
+        series = pd.to_numeric(frame[column], errors="raise").astype("float64")
+        return series.replace([np.inf, -np.inf], np.nan).dropna()
+
+    before_values, after_values = _clean(before), _clean(after)
+    if before_values.empty or after_values.empty:
+        raise ValueError(f"Column {column!r} has no finite values in one of the frames")
+
+    fig = Figure(figsize=(10, 4), facecolor=WHITE)
+    left, right = fig.subplots(1, 2)
+
+    left.hist(before_values, bins=bins, color=_cat(5), edgecolor="white", alpha=0.9)
+    left.set_title(f"{labels[0]} (n={len(before_values):,})")
+    left.set_xlabel(column)
+    left.set_ylabel("Count")
+    left.grid(axis="y", alpha=0.3)
+
+    right.hist(after_values, bins=bins, color=_PRIMARY, edgecolor="white", alpha=0.9)
+    right.set_title(f"{labels[1]} (n={len(after_values):,})")
+    right.set_xlabel(column)
+    right.grid(axis="y", alpha=0.3)
+
+    return _finalize(fig)
+
+
+# ---------------------------------------------------------------------------
+# Statistical diagnostics
+# ---------------------------------------------------------------------------
+
+def plot_qq(values: Sequence[float], *, ax: Axes | None = None) -> Figure:
+    """Plot a normal Q-Q diagnostic.
+
+    Points close to the dashed reference line mean the sample's quantiles
+    match a normal distribution with the sample's own mean and standard
+    deviation. A visual companion to the normality tests.
+
+    Parameters
+    ----------
+    values:
+        One-dimensional numeric sample.
+    ax:
+        Existing matplotlib ``Axes`` to draw on.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+
+    Raises
+    ------
+    TypeError
+        If ``values`` cannot be converted to numbers.
+    ValueError
+        If ``values`` is empty, contains missing/infinite values, has fewer
+        than 3 observations, or is constant.
+
+    Assumptions
+    -----------
+    - Missing or infinite values raise rather than being dropped, matching
+      the statistical layer's rule of never silently transforming data.
+    - Theoretical quantiles use plotting positions ``(i - 0.5) / n``.
+    - A Q-Q plot is a judgement aid, not a test; it does not replace
+      ``normality_test``.
+    """
+    numeric = _validate_numeric_array(values, name="values")
+    if numeric.size < 3:
+        raise ValueError("plot_qq requires at least 3 observations.")
+    if float(np.ptp(numeric)) == 0:
+        raise ValueError("plot_qq requires values that are not all identical.")
+
+    observed = np.sort(numeric)
+    probabilities = (np.arange(1, observed.size + 1) - 0.5) / observed.size
+    theoretical = float(np.mean(observed)) + float(np.std(observed, ddof=1)) * stats.norm.ppf(probabilities)
+
+    fig, ax = _get_figure_and_axes(ax, _DEFAULT_FIGSIZE)
+    ax.scatter(theoretical, observed, alpha=0.7, color=_PRIMARY, edgecolor="none")
+    lower = min(theoretical.min(), observed.min())
+    upper = max(theoretical.max(), observed.max())
+    ax.plot([lower, upper], [lower, upper], color=INK, linestyle="--", linewidth=1.1)
+    ax.set_title("Normal Q-Q plot")
+    ax.set_xlabel("Theoretical quantiles")
+    ax.set_ylabel("Observed quantiles")
+    ax.grid(alpha=0.3)
+    return _finalize(fig)
+
+
+def plot_regression_diagnostics(model: Any) -> Figure:
+    """Plot the four standard OLS residual diagnostics in one figure.
+
+    Panels: residuals vs fitted (curvature / non-linearity), a normal Q-Q of
+    standardized residuals (normality), scale-location (constant variance),
+    and a histogram of residuals.
+
+    Parameters
+    ----------
+    model:
+        A fitted regression results object exposing ``resid`` and
+        ``fittedvalues`` — e.g. the ``statsmodels`` results returned by
+        ``ols_regression``. Duck-typed; ``statsmodels`` is not imported here.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+
+    Raises
+    ------
+    TypeError
+        If ``model`` does not expose ``resid`` and ``fittedvalues``.
+    ValueError
+        If residuals/fitted values are empty, non-finite, of different lengths,
+        fewer than 3, or the residuals have zero variance.
+
+    Assumptions
+    -----------
+    - Residuals are standardized as ``(r - mean) / sd`` (``ddof=1``), a
+      simple stand-in for studentized residuals that needs no leverage
+      information.
+    - These panels support judgement; for formal tests use the
+      ``regression_diagnostics`` function in the statistical layer.
+    - This function owns a four-panel figure and does not accept ``ax``.
+    """
+    if not (hasattr(model, "resid") and hasattr(model, "fittedvalues")):
+        raise TypeError("model must expose 'resid' and 'fittedvalues' (e.g. a statsmodels OLS result).")
+
+    residuals = _validate_numeric_array(model.resid, name="model.resid")
+    fitted = _validate_numeric_array(model.fittedvalues, name="model.fittedvalues")
+    if residuals.size != fitted.size:
+        raise ValueError("model.resid and model.fittedvalues must have the same length.")
+    if residuals.size < 3:
+        raise ValueError("At least 3 observations are required.")
+
+    spread = float(np.std(residuals, ddof=1))
+    if spread == 0:
+        raise ValueError("Residuals have zero variance; diagnostics are undefined.")
+    standardized = (residuals - float(np.mean(residuals))) / spread
+
+    fig = Figure(figsize=(10, 8), facecolor=WHITE)
+    (a, b), (c, d) = fig.subplots(2, 2)
+
+    a.scatter(fitted, residuals, alpha=0.6, color=_PRIMARY, edgecolor="none")
+    a.axhline(0, color=ACCENT, linestyle="--", linewidth=1.3)
+    a.set_title("Residuals vs fitted")
+    a.set_xlabel("Fitted values")
+    a.set_ylabel("Residuals")
+    a.grid(alpha=0.3)
+
+    ordered = np.sort(standardized)
+    positions = (np.arange(1, ordered.size + 1) - 0.5) / ordered.size
+    theoretical = stats.norm.ppf(positions)
+    b.scatter(theoretical, ordered, alpha=0.7, color=_PRIMARY, edgecolor="none")
+    limit = max(abs(theoretical).max(), abs(ordered).max())
+    b.plot([-limit, limit], [-limit, limit], color=INK, linestyle="--", linewidth=1.1)
+    b.set_title("Normal Q-Q (standardized residuals)")
+    b.set_xlabel("Theoretical quantiles")
+    b.set_ylabel("Standardized residuals")
+    b.grid(alpha=0.3)
+
+    c.scatter(fitted, np.sqrt(np.abs(standardized)), alpha=0.6, color=_PRIMARY, edgecolor="none")
+    c.set_title("Scale-location")
+    c.set_xlabel("Fitted values")
+    c.set_ylabel("sqrt(|standardized residuals|)")
+    c.grid(alpha=0.3)
+
+    d.hist(residuals, bins=min(30, max(5, residuals.size // 5)), color=_PRIMARY,
+           edgecolor="white", alpha=0.85)
+    d.set_title("Residual distribution")
+    d.set_xlabel("Residuals")
+    d.set_ylabel("Count")
+    d.grid(axis="y", alpha=0.3)
+
+    return _finalize(fig)
+
+
+def plot_time_series(
+    frame: pd.DataFrame,
+    time_column: str,
+    value_column: str,
+    *,
+    rolling_window: int | None = None,
+    ax: Axes | None = None,
+) -> Figure:
+    """Plot an ordered numeric series over time, with an optional rolling mean.
+
+    Parameters
+    ----------
+    frame:
+        Input pandas DataFrame.
+    time_column:
+        Column parsed as datetimes.
+    value_column:
+        Numeric column to plot.
+    rolling_window:
+        If given (>= 2), overlay a rolling mean over this many observations.
+    ax:
+        Existing matplotlib ``Axes`` to draw on.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+
+    Raises
+    ------
+    TypeError
+        If ``frame`` is not a DataFrame or ``value_column`` is not numeric.
+    KeyError
+        If a column does not exist.
+    ValueError
+        If ``rolling_window`` is less than 2, or no valid observations remain.
+
+    Assumptions
+    -----------
+    - ``time_column`` is parsed with ``errors="coerce"``: rows whose time
+      cannot be parsed, or whose value is missing, are dropped silently.
+      Check the parse yourself if a badly-formatted date column is possible.
+    - Rows are sorted by time before plotting, so out-of-order input is
+      drawn chronologically. Irregular spacing is not resampled: gaps in
+      time are drawn as straight lines between observed points.
+    - The rolling mean counts observations, not calendar time.
+    """
+    _validate_dataframe(frame)
+    _validate_columns_exist(frame, [time_column, value_column])
+    if not pd.api.types.is_numeric_dtype(frame[value_column]):
+        raise TypeError(f"Column {value_column!r} must be numeric.")
+    if rolling_window is not None and rolling_window < 2:
+        raise ValueError("rolling_window must be >= 2 or None.")
+
+    working = frame[[time_column, value_column]].copy()
+    working[time_column] = pd.to_datetime(working[time_column], errors="coerce")
+    working = working.dropna().sort_values(time_column)
+    if working.empty:
+        raise ValueError("No valid observations remain after parsing the time column.")
+
+    fig, ax = _get_figure_and_axes(ax, (9, 5))
+    ax.plot(working[time_column], working[value_column], color=_PRIMARY, linewidth=1.8, label=value_column)
+    if rolling_window is not None:
+        rolling = working[value_column].rolling(rolling_window, min_periods=rolling_window).mean()
+        ax.plot(working[time_column], rolling, color=ACCENT, linestyle="--", linewidth=1.4,
+                label=f"{rolling_window}-period rolling mean")
+        ax.legend(frameon=False)
+    ax.set_title(f"{value_column} over time")
+    ax.set_xlabel(time_column)
+    ax.set_ylabel(value_column)
+    ax.grid(alpha=0.3)
+    fig.autofmt_xdate()
+    return _finalize(fig)
+
+
+def plot_forecast(
+    history: Sequence[float],
+    forecast: pd.DataFrame,
+    history_tail: int | None = None,
+    ax: Axes | None = None,
+) -> Figure:
+    """Plot a series' history followed by its forecast and prediction interval.
+
+    Designed for the DataFrame returned by ``forecast_arima`` (columns
+    ``forecast``, ``lower``, ``upper``).
+
+    Parameters
+    ----------
+    history:
+        The observed series the model was fit on, in chronological order.
+    forecast:
+        A DataFrame with a ``forecast`` column and, optionally, ``lower`` and
+        ``upper`` columns, one row per future step.
+    history_tail:
+        If given, draw only the last ``history_tail`` observations, so a long
+        history does not flatten the forecast.
+    ax:
+        Existing matplotlib ``Axes`` to draw on.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+
+    Raises
+    ------
+    TypeError
+        If ``forecast`` is not a DataFrame.
+    KeyError
+        If ``forecast`` has no ``forecast`` column.
+    ValueError
+        If ``history`` is empty or non-finite, ``forecast`` has no rows or
+        non-finite values, or ``history_tail`` is less than 1.
+
+    Assumptions
+    -----------
+    - The x-axis is the step index (history ``0..n-1``, forecast ``n..n+h-1``),
+      not calendar time; ``forecast_arima`` does not carry dates.
+    - The shaded band is labelled "Prediction interval" without a percentage,
+      because its level is set by the model that produced it (95% by
+      statsmodels' default) and is not recorded in the frame.
+    - Missing or infinite values raise rather than being dropped, since
+      dropping one would silently shift every later point along the x-axis.
+    """
+    values = _validate_numeric_array(history, name="history")
+    if not isinstance(forecast, pd.DataFrame):
+        raise TypeError("forecast must be a pandas DataFrame.")
+    _validate_columns_exist(forecast, ["forecast"])
+    if forecast.empty:
+        raise ValueError("forecast has no rows.")
+    if history_tail is not None and history_tail < 1:
+        raise ValueError("history_tail must be >= 1 or None.")
+
+    predicted = _validate_numeric_array(forecast["forecast"], name="forecast['forecast']")
+    has_band = {"lower", "upper"}.issubset(forecast.columns)
+    if has_band:
+        lower = _validate_numeric_array(forecast["lower"], name="forecast['lower']")
+        upper = _validate_numeric_array(forecast["upper"], name="forecast['upper']")
+
+    n, horizon = values.size, predicted.size
+    x_history = np.arange(n)
+    x_forecast = np.arange(n, n + horizon)
+
+    if history_tail is not None and history_tail < n:
+        x_history = x_history[-history_tail:]
+        values = values[-history_tail:]
+
+    fig, ax = _get_figure_and_axes(ax, (9, 5))
+    ax.plot(x_history, values, color=_PRIMARY, linewidth=1.8, label="Observed")
+    ax.plot(
+        np.r_[x_history[-1], x_forecast], np.r_[values[-1], predicted],
+        color=ACCENT, linewidth=1.8, linestyle="--", label="Forecast",
+    )
+    if has_band:
+        ax.fill_between(x_forecast, lower, upper, color=ACCENT, alpha=0.18, label="Prediction interval")
+    ax.axvline(n - 0.5, color=BORDER, linestyle=":", linewidth=1.2)
+    ax.set_title("Forecast")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Value")
+    ax.grid(alpha=0.3)
+    ax.legend(frameon=False, loc="best")
+    return _finalize(fig)
 
 
 # ---------------------------------------------------------------------------
@@ -1053,7 +2071,7 @@ def plot_pca_scatter(
     fig, ax = _get_figure_and_axes(ax, _DEFAULT_FIGSIZE)
 
     if hue is None:
-        ax.scatter(working[x_component], working[y_component], alpha=0.6, color="#4C72B0", edgecolor="none")
+        ax.scatter(working[x_component], working[y_component], alpha=0.6, color=_PRIMARY, edgecolor="none")
     else:
         if len(hue) != len(transformed):
             raise ValueError(
@@ -1079,11 +2097,10 @@ def plot_pca_scatter(
     ax.set_xlabel(x_label)
     ax.set_ylabel(y_label)
     ax.set_title("PCA components")
-    ax.axhline(0, color="gray", linewidth=0.8, alpha=0.5)
-    ax.axvline(0, color="gray", linewidth=0.8, alpha=0.5)
+    ax.axhline(0, color=MUTED, linewidth=0.8, alpha=0.5)
+    ax.axvline(0, color=MUTED, linewidth=0.8, alpha=0.5)
     ax.grid(alpha=0.3)
-    fig.tight_layout()
-    return fig
+    return _finalize(fig)
 
 
 def plot_cluster_scatter(
@@ -1168,8 +2185,7 @@ def plot_cluster_scatter(
     ax.set_ylabel(y)
     ax.set_title("Cluster assignments")
     ax.grid(alpha=0.3)
-    fig.tight_layout()
-    return fig
+    return _finalize(fig)
 
 
 def plot_elbow(
@@ -1222,14 +2238,13 @@ def plot_elbow(
     ordered = elbow_frame.sort_values(k_column)
 
     fig, ax = _get_figure_and_axes(ax, _DEFAULT_FIGSIZE)
-    ax.plot(ordered[k_column], ordered[score_column], marker="o", color="#4C72B0")
+    ax.plot(ordered[k_column], ordered[score_column], marker="o", color=_PRIMARY)
     ax.set_xlabel(k_column.replace("_", " ").title())
     ax.set_ylabel(score_column.replace("_", " ").title())
     ax.set_title("Elbow plot")
     ax.set_xticks(ordered[k_column])
     ax.grid(alpha=0.3)
-    fig.tight_layout()
-    return fig
+    return _finalize(fig)
 
 
 def plot_silhouette_by_k(
@@ -1285,14 +2300,13 @@ def plot_silhouette_by_k(
         )
 
     fig, ax = _get_figure_and_axes(ax, _DEFAULT_FIGSIZE)
-    ax.plot(list(k_values), list(scores), marker="o", color="#4C72B0")
+    ax.plot(list(k_values), list(scores), marker="o", color=_PRIMARY)
     ax.set_xlabel("Number of clusters (k)")
     ax.set_ylabel("Silhouette score")
     ax.set_title("Silhouette score by k")
     ax.set_xticks(list(k_values))
     ax.grid(alpha=0.3)
-    fig.tight_layout()
-    return fig
+    return _finalize(fig)
 
 
 # ---------------------------------------------------------------------------
@@ -1346,11 +2360,11 @@ def plot_confusion_matrix(
 
     fig, ax = _get_figure_and_axes(ax, (6, 6))
     ConfusionMatrixDisplay.from_predictions(
-        y_true, y_pred, labels=labels, normalize=normalize, ax=ax, colorbar=True
+        y_true, y_pred, labels=labels, normalize=normalize, ax=ax,
+        colorbar=True, cmap=_SEQUENTIAL,
     )
     ax.set_title("Confusion matrix")
-    fig.tight_layout()
-    return fig
+    return _finalize(fig)
 
 
 def plot_roc_curve(
@@ -1404,7 +2418,12 @@ def plot_roc_curve(
 
     fig, ax = _get_figure_and_axes(ax, _DEFAULT_FIGSIZE)
     RocCurveDisplay.from_predictions(y_true, y_score, pos_label=pos_label, ax=ax)
-    ax.plot([0, 1], [0, 1], linestyle="--", color="gray", linewidth=1, label="Chance")
+    # Recolour after the fact rather than passing colour kwargs: scikit-learn's
+    # display API for line styling has changed between releases.
+    if ax.lines:
+        ax.lines[0].set_color(_PRIMARY)
+        ax.lines[0].set_linewidth(2)
+    ax.plot([0, 1], [0, 1], linestyle="--", color=MUTED, linewidth=1, label="Chance")
     # Override scikit-learn's auto-generated labels (which append
     # "(Positive label: X)" whenever pos_label was inferred rather than
     # given explicitly) with the plain, stable label text.
@@ -1413,8 +2432,7 @@ def plot_roc_curve(
     ax.set_title("ROC curve")
     ax.legend(loc="lower right", fontsize=8)
     ax.grid(alpha=0.3)
-    fig.tight_layout()
-    return fig
+    return _finalize(fig)
 
 
 def plot_precision_recall_curve(
@@ -1464,10 +2482,111 @@ def plot_precision_recall_curve(
 
     fig, ax = _get_figure_and_axes(ax, _DEFAULT_FIGSIZE)
     PrecisionRecallDisplay.from_predictions(y_true, y_score, pos_label=pos_label, ax=ax)
+    if ax.lines:
+        ax.lines[0].set_color(_PRIMARY)
+        ax.lines[0].set_linewidth(2)
     ax.set_title("Precision-recall curve")
     ax.grid(alpha=0.3)
-    fig.tight_layout()
-    return fig
+    return _finalize(fig)
+
+
+def plot_calibration_curve(
+    y_true: Sequence[Any],
+    y_probability: Sequence[float],
+    *,
+    n_bins: int = 10,
+    pos_label: Any = None,
+    ax: Axes | None = None,
+) -> Figure:
+    """Plot predicted probability against observed event frequency.
+
+    A well-calibrated classifier's points lie on the diagonal: among cases
+    given a predicted probability of about 0.7, roughly 70% are positive.
+
+    Parameters
+    ----------
+    y_true:
+        True binary class labels.
+    y_probability:
+        Predicted probability of the positive class, each in ``[0, 1]``.
+    n_bins:
+        Number of equal-width probability bins (at least 2).
+    pos_label:
+        Which class is "positive". Defaults to the greater of the two labels
+        (scikit-learn's convention for ``{0, 1}``-like labels); required
+        explicitly if the labels cannot be ordered.
+    ax:
+        Existing matplotlib ``Axes`` to draw on.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+
+    Raises
+    ------
+    ValueError
+        If the inputs are empty or of mismatched length, ``n_bins`` is less
+        than 2, probabilities are non-finite or outside ``[0, 1]``,
+        ``y_true`` does not have exactly two classes, or ``pos_label`` is not
+        one of them.
+
+    Assumptions
+    -----------
+    - Rows whose ``y_true`` is missing are dropped from both inputs.
+    - The positive class is chosen by **label value**, not by order of
+      appearance. An earlier version used whichever label happened to occur
+      last in the data, so the curve could flip between mirror images
+      depending on row order.
+    - Bins with no predictions are skipped, so the line can have fewer than
+      ``n_bins`` points; sparsely populated bins give noisy points.
+    """
+    _validate_array_pair(y_true, y_probability, ("y_true", "y_probability"))
+    if n_bins < 2:
+        raise ValueError("n_bins must be >= 2.")
+    probability = _validate_numeric_array(y_probability, name="y_probability")
+    if np.any((probability < 0) | (probability > 1)):
+        raise ValueError("y_probability values must be between 0 and 1.")
+
+    target = pd.Series(np.asarray(y_true, dtype=object))
+    valid = target.notna().to_numpy()
+    target, probability = target[valid], probability[valid]
+    if target.empty:
+        raise ValueError("y_true has no non-missing values.")
+
+    classes = list(target.unique())
+    if len(classes) != 2:
+        raise ValueError(f"Calibration curves require exactly two target classes; got {len(classes)}.")
+    if pos_label is None:
+        try:
+            positive = sorted(classes)[-1]
+        except TypeError as exc:
+            raise ValueError("Class labels cannot be ordered; pass pos_label explicitly.") from exc
+    elif pos_label in classes:
+        positive = pos_label
+    else:
+        raise ValueError(f"pos_label {pos_label!r} is not one of the classes {classes!r}.")
+
+    observed = (target == positive).to_numpy(dtype=float)
+    edges = np.linspace(0, 1, n_bins + 1)
+    centers: list[float] = []
+    fractions: list[float] = []
+    for lower, upper in zip(edges[:-1], edges[1:]):
+        in_bin = (probability >= lower) & ((probability <= upper) if upper == 1 else (probability < upper))
+        if np.any(in_bin):
+            centers.append(float(probability[in_bin].mean()))
+            fractions.append(float(observed[in_bin].mean()))
+
+    fig, ax = _get_figure_and_axes(ax, _DEFAULT_FIGSIZE)
+    ax.plot([0, 1], [0, 1], color=MUTED, linestyle="--", linewidth=1, label="Perfect calibration")
+    ax.plot(centers, fractions, marker="o", color=_PRIMARY, linewidth=1.8, label="Model")
+    ax.set_title("Calibration curve")
+    ax.set_xlabel("Mean predicted probability")
+    ax.set_ylabel("Observed frequency")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.grid(alpha=0.3)
+    ax.legend(frameon=False)
+    return _finalize(fig)
 
 
 def plot_residuals(
@@ -1511,14 +2630,63 @@ def plot_residuals(
     residuals = y_true_array - y_pred_array
 
     fig, ax = _get_figure_and_axes(ax, _DEFAULT_FIGSIZE)
-    ax.scatter(y_pred_array, residuals, alpha=0.6, color="#4C72B0", edgecolor="none")
-    ax.axhline(0, color="#C44E52", linestyle="--", linewidth=1.5)
+    ax.scatter(y_pred_array, residuals, alpha=0.6, color=_PRIMARY, edgecolor="none")
+    ax.axhline(0, color=ACCENT, linestyle="--", linewidth=1.5)
     ax.set_xlabel("Predicted")
     ax.set_ylabel("Residual")
     ax.set_title("Residuals vs predicted")
     ax.grid(alpha=0.3)
-    fig.tight_layout()
-    return fig
+    return _finalize(fig)
+
+
+def plot_prediction_error(
+    y_true: Sequence[float],
+    y_pred: Sequence[float],
+    *,
+    ax: Axes | None = None,
+) -> Figure:
+    """Plot residual error against predicted values, with strict input checks.
+
+    The same picture as :func:`plot_residuals`, but inputs that contain
+    missing or non-finite values raise instead of propagating ``NaN`` into
+    the plot — the stricter variant, for pipelines that should fail loudly.
+
+    Parameters
+    ----------
+    y_true, y_pred:
+        True and predicted numeric target values.
+    ax:
+        Existing matplotlib ``Axes`` to draw on.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+
+    Raises
+    ------
+    TypeError
+        If either input contains non-numeric values.
+    ValueError
+        If the inputs are empty, of mismatched length, or non-finite.
+
+    Assumptions
+    -----------
+    Residuals are ``y_true - y_pred``, so points above zero are
+    under-predictions.
+    """
+    _validate_array_pair(y_true, y_pred, ("y_true", "y_pred"))
+    actual = _validate_numeric_array(y_true, name="y_true")
+    predicted = _validate_numeric_array(y_pred, name="y_pred")
+    residuals = actual - predicted
+
+    fig, ax = _get_figure_and_axes(ax, _DEFAULT_FIGSIZE)
+    ax.scatter(predicted, residuals, alpha=0.65, color=_PRIMARY, edgecolor="none")
+    ax.axhline(0, color=INK, linestyle="--", linewidth=1.1)
+    ax.set_title("Prediction error")
+    ax.set_xlabel("Predicted value")
+    ax.set_ylabel("Residual")
+    ax.grid(alpha=0.3)
+    return _finalize(fig)
 
 
 def plot_predicted_vs_actual(
@@ -1559,13 +2727,13 @@ def plot_predicted_vs_actual(
     y_pred_array = np.asarray(y_pred, dtype=float)
 
     fig, ax = _get_figure_and_axes(ax, _DEFAULT_FIGSIZE)
-    ax.scatter(y_true_array, y_pred_array, alpha=0.6, color="#4C72B0", edgecolor="none")
+    ax.scatter(y_true_array, y_pred_array, alpha=0.6, color=_PRIMARY, edgecolor="none")
 
     combined_min = min(y_true_array.min(), y_pred_array.min())
     combined_max = max(y_true_array.max(), y_pred_array.max())
     ax.plot(
         [combined_min, combined_max], [combined_min, combined_max],
-        color="#C44E52", linestyle="--", linewidth=1.5, label="Perfect prediction",
+        color=ACCENT, linestyle="--", linewidth=1.5, label="Perfect prediction",
     )
 
     ax.set_xlabel("Actual")
@@ -1573,8 +2741,7 @@ def plot_predicted_vs_actual(
     ax.set_title("Predicted vs actual")
     ax.legend(loc="best", fontsize=8)
     ax.grid(alpha=0.3)
-    fig.tight_layout()
-    return fig
+    return _finalize(fig)
 
 
 def plot_feature_importance(
@@ -1653,13 +2820,12 @@ def plot_feature_importance(
     working = working.iloc[::-1]  # reverse so largest ends up at the top when plotted
 
     fig, ax = _get_figure_and_axes(ax, (8, max(4, 0.4 * len(working))))
-    ax.barh(working["feature"], working["importance"], color="#4C72B0", edgecolor="white", alpha=0.85)
+    ax.barh(working["feature"], working["importance"], color=_PRIMARY, edgecolor="white", alpha=0.85)
     ax.set_xlabel("Importance")
     ax.set_ylabel("Feature")
     ax.set_title("Feature importance")
     ax.grid(axis="x", alpha=0.3)
-    fig.tight_layout()
-    return fig
+    return _finalize(fig)
 
 
 def plot_cross_validation_scores(
@@ -1732,19 +2898,91 @@ def plot_cross_validation_scores(
     labels = [column.replace("test_", "").replace("_", " ") for column in score_columns]
 
     fig, ax = _get_figure_and_axes(ax, _DEFAULT_FIGSIZE)
-    ax.boxplot(data, tick_labels=labels)
+    _boxplot(ax, data, labels)
 
     jitter_rng = np.random.RandomState(0)
     for position, values in enumerate(data, start=1):
         jitter = jitter_rng.normal(0, 0.04, size=len(values))
         ax.scatter(
             np.full(len(values), position) + jitter, values,
-            alpha=0.6, color="#4C72B0", s=15, zorder=3, edgecolor="none",
+            alpha=0.7, color=TEAL_DARK, s=15, zorder=3, edgecolor="none",
         )
 
     ax.set_ylabel("Score")
     ax.set_title("Cross-validation scores by fold")
     ax.set_xticklabels(labels, rotation=30, ha="right")
     ax.grid(axis="y", alpha=0.3)
-    fig.tight_layout()
-    return fig
+    return _finalize(fig)
+
+
+def plot_model_comparison(
+    comparison: pd.DataFrame,
+    *,
+    model_column: str = "model",
+    metric_column: str = "score",
+    ascending: bool = False,
+    top_n: int | None = None,
+    ax: Axes | None = None,
+) -> Figure:
+    """Plot ranked model-comparison scores as a horizontal bar chart.
+
+    Parameters
+    ----------
+    comparison:
+        A DataFrame with one row per model.
+    model_column:
+        Column holding model names.
+    metric_column:
+        Numeric column holding the score to rank by.
+    ascending:
+        ``False`` (default) ranks higher scores first, for metrics where
+        bigger is better (accuracy, R²). Use ``True`` for error metrics
+        (RMSE, log-loss) where smaller is better.
+    top_n:
+        Show only the best ``top_n`` models after ranking.
+    ax:
+        Existing matplotlib ``Axes`` to draw on.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+
+    Raises
+    ------
+    TypeError
+        If ``comparison`` is not a DataFrame or ``metric_column`` is not numeric.
+    KeyError
+        If a named column does not exist.
+    ValueError
+        If ``comparison`` is empty or ``top_n`` is less than 1.
+
+    Assumptions
+    -----------
+    - The best model is drawn at the **top**. Which direction is "best" is
+      the caller's choice via ``ascending``; nothing here knows what the
+      metric means.
+    - Scores are single numbers, so the chart carries no uncertainty. Models
+      separated by less than the fold-to-fold variation (see
+      :func:`plot_cross_validation_scores`) are not meaningfully ranked.
+    """
+    _validate_dataframe(comparison)
+    _validate_columns_exist(comparison, [model_column, metric_column])
+    if comparison.empty:
+        raise ValueError("comparison is empty.")
+    if not pd.api.types.is_numeric_dtype(comparison[metric_column]):
+        raise TypeError(f"Column {metric_column!r} must be numeric.")
+    if top_n is not None and top_n < 1:
+        raise ValueError("top_n must be >= 1 or None.")
+
+    working = comparison[[model_column, metric_column]].sort_values(metric_column, ascending=ascending)
+    if top_n is not None:
+        working = working.head(top_n)
+    working = working.iloc[::-1]
+
+    fig, ax = _get_figure_and_axes(ax, (8, max(4.5, 0.42 * len(working))))
+    bars = ax.barh(working[model_column].astype(str), working[metric_column], color=_PRIMARY, edgecolor="none")
+    ax.bar_label(bars, labels=[f"{v:.4f}" for v in working[metric_column]], padding=4, fontsize=8, color=MUTED)
+    ax.set_title("Model comparison")
+    ax.set_xlabel(metric_column.replace("_", " ").title())
+    ax.grid(axis="x", alpha=0.3)
+    return _finalize(fig)

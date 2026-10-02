@@ -51,3 +51,8 @@ catboost_info/
 
 # Temporary test files
 html_test.py
+
+# Local development backups
+*_backup.py
+*_backup.md
+*_before_*.py

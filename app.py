@@ -42,6 +42,8 @@ from makoding import (
     unsupervised,
 )
 
+from makoding.ui import shell
+
 from makoding.config import (
     APP,
     LIMITS,
@@ -813,7 +815,7 @@ def render_visual_overview(frame: pd.DataFrame) -> None:
 
 with st.sidebar:
 
-    styling.render_sidebar_brand()
+    shell.render_sidebar_navigation()
 
     st.markdown("### Data source")
 
@@ -1180,36 +1182,103 @@ st.markdown(
 )
 
 
+
 # ============================================================================
-# Navigation
+# Fabric-inspired workspace navigation
 # ============================================================================
 
-(
-    overview_tab,
-    eda_tab,
-    statistical_tab,
-    feature_tab,
-    model_tab,
-    unsupervised_tab,
-    downloads_tab,
-) = st.tabs(
-    [
-        "Overview",
-        "EDA",
-        "Statistical Analysis",
-        "Feature Engineering",
-        "Model Builder",
-        "Unsupervised",
-        "Downloads",
-    ]
+active_workspace = shell.get_active_workspace().key
+
+shell.render_workspace_header(
+    source_name=source_name,
+    frame=(
+        current_dataset
+        if active_workspace in {"home", "data", "clean"}
+        else None
+    ),
 )
+
+
+# ============================================================================
+# Home
+# ============================================================================
+
+if active_workspace == "home":
+
+    styling.render_workspace_intro(
+        "Your analytical workspace",
+        (
+            "Select a workspace on the left to explore, clean, "
+            "analyse, model or export your data."
+        ),
+    )
+
+    st.subheader("Dataset at a glance")
+
+    display_dataframe(
+        current_dataset.head(
+            min(10, LIMITS.max_preview_rows)
+        )
+    )
+
+
+# ============================================================================
+# Clean
+# ============================================================================
+
+if active_workspace == "clean":
+
+    styling.render_section(
+        "Data preparation",
+        "01",
+    )
+
+    st.caption(
+        "Adjust cleaning settings in the sidebar. "
+        "Changes apply to the working dataset on rerun."
+    )
+
+    report = st.session_state.get("cleaning_report")
+
+    if report is not None:
+        styling.render_audit_summary(report)
+
+    styling.render_section(
+        "Cleaned data preview",
+        "02",
+    )
+
+    display_dataframe(
+        current_dataset.head(
+            LIMITS.max_preview_rows
+        )
+    )
+
+
+# ============================================================================
+# Reports
+# ============================================================================
+
+if active_workspace == "reports":
+
+    styling.render_section(
+        "Analytical report",
+        "01",
+    )
+
+    render_downloads(
+        current_dataset,
+        source_name,
+        st.session_state["cleaning_report"],
+        key_prefix="reports_workspace",
+    )
 
 
 # ============================================================================
 # Overview
 # ============================================================================
 
-with overview_tab:
+if active_workspace == "data":
 
     styling.render_section(
         "Dataset overview",
@@ -1302,7 +1371,7 @@ with overview_tab:
 # EDA
 # ============================================================================
 
-with eda_tab:
+if active_workspace == "explore":
 
     styling.render_section(
         "Exploratory data analysis",
@@ -1446,7 +1515,7 @@ with eda_tab:
 # Statistical analysis
 # ============================================================================
 
-with statistical_tab:
+if active_workspace == "statistics":
     statistical_ui.render_statistical_analysis(current_dataset)
 
 
@@ -1454,7 +1523,7 @@ with statistical_tab:
 # Feature engineering
 # ============================================================================
 
-with feature_tab:
+if active_workspace == "features":
 
     styling.render_section(
         "Feature engineering",
@@ -1903,7 +1972,7 @@ with feature_tab:
 # Model Builder
 # ============================================================================
 
-with model_tab:
+if active_workspace == "models":
 
     styling.render_section(
         "Model builder",
@@ -2305,7 +2374,7 @@ with model_tab:
 # Unsupervised learning
 # ============================================================================
 
-with unsupervised_tab:
+if active_workspace == "clustering":
 
     styling.render_section(
         "Unsupervised learning",
@@ -2828,12 +2897,11 @@ with unsupervised_tab:
                             )
 
 
-
 # ============================================================================
 # Downloads
 # ============================================================================
 
-with downloads_tab:
+if active_workspace == "export":
     styling.render_section(
         "Export your work",
         "01",

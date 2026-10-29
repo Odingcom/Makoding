@@ -1,4 +1,4 @@
-﻿"""Streamlit interface for Makoding statistical analysis.
+"""Streamlit interface for Makoding statistical analysis.
 
 This module is the presentation layer for ``makoding.statistical_analysis``.
 The statistical engine remains framework-independent and reusable.
@@ -566,7 +566,6 @@ def _render_hypothesis_tests(frame: pd.DataFrame) -> None:
         selected = st.multiselect(
             "Group variables",
             numeric,
-            min_selections=2,
             key="stats_anova_groups",
         )
 
@@ -683,7 +682,6 @@ def _render_hypothesis_tests(frame: pd.DataFrame) -> None:
         selected = st.multiselect(
             "Group variables",
             numeric,
-            min_selections=2,
             key="stats_kruskal_groups",
         )
 
@@ -965,7 +963,6 @@ def _render_effect_sizes(frame: pd.DataFrame) -> None:
         selected = st.multiselect(
             "Group variables",
             numeric,
-            min_selections=2,
             key="stats_effect_groups",
         )
 

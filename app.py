@@ -16,6 +16,7 @@ The reusable analytical logic remains inside the Makoding package.
 """
 
 from __future__ import annotations
+from makoding.ui.dashboard import render_home_dashboard, record_activity
 
 import base64
 import io
@@ -1204,6 +1205,10 @@ shell.render_workspace_header(
 # ============================================================================
 
 if active_workspace == "home":
+    render_home_dashboard(
+        current_dataset,
+        source_name,
+    )
 
     styling.render_workspace_intro(
         "Your analytical workspace",

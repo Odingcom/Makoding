@@ -44,6 +44,7 @@ from makoding import (
 )
 
 from makoding.ui import shell
+from makoding.ui.cleaning_studio import ensure_processing_state, render_cleaning_studio
 
 from makoding.config import (
     APP,
@@ -850,26 +851,7 @@ with st.sidebar:
 
     st.markdown("---")
 
-    st.markdown("### Cleaning")
-
-    missing_strategy = st.selectbox(
-        "Missing values",
-        options=cleaning.MISSING_STRATEGIES,
-        index=0,
-        help=(
-            "Choose how missing values should be handled."
-        ),
-    )
-
-    remove_duplicates = st.checkbox(
-        "Remove duplicate rows",
-        value=True,
-    )
-
-    trim_whitespace = st.checkbox(
-        "Trim text whitespace",
-        value=True,
-    )
+    # All cleaning actions now live in the dedicated Clean workspace.
 
 
 # ============================================================================
@@ -1123,46 +1105,14 @@ source_name = (
 
 
 # ============================================================================
-# Cleaning
+# Explicit working dataset (no automatic cleaning on page reruns)
 # ============================================================================
 
-try:
-
-    cleaned_frame, cleaning_report = (
-        cleaning.clean_frame(
-            current_dataset,
-            missing=missing_strategy,
-            remove_duplicates=remove_duplicates,
-            trim_whitespace=trim_whitespace,
-        )
-    )
-
-    current_dataset = cleaned_frame
-
-    st.session_state["cleaning_report"] = (
-        cleaning_report
-    )
-
-except Exception as exc:
-
-    logger.exception(
-        "Unexpected cleaning failure."
-    )
-
-    st.error(
-        "The dataset loaded successfully, "
-        "but cleaning could not be completed."
-    )
-
-    with st.expander(
-        "Technical details"
-    ):
-
-        st.code(
-            f"{type(exc).__name__}: {exc}"
-        )
-
-    st.stop()
+ensure_processing_state(
+    st.session_state["source_key"],
+    st.session_state["dataframe"],
+)
+current_dataset = st.session_state["working_dataframe"]
 
 
 # ============================================================================
@@ -1232,37 +1182,8 @@ if active_workspace == "home":
 # ============================================================================
 
 if active_workspace == "clean":
+    render_cleaning_studio(st.session_state["dataframe"])
 
-    styling.render_section(
-        "Data preparation",
-        "01",
-    )
-
-    st.caption(
-        "Adjust cleaning settings in the sidebar. "
-        "Changes apply to the working dataset on rerun."
-    )
-
-    report = st.session_state.get("cleaning_report")
-
-    if report is not None:
-        styling.render_audit_summary(report)
-
-    styling.render_section(
-        "Cleaned data preview",
-        "02",
-    )
-
-    display_dataframe(
-        current_dataset.head(
-            LIMITS.max_preview_rows
-        )
-    )
-
-
-# ============================================================================
-# Reports
-# ============================================================================
 
 if active_workspace == "reports":
 

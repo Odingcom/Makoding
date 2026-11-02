@@ -9,3 +9,5 @@ openpyxl
 xgboost
 lightgbm
 catboost
+reportlab==5.1.0
+pypdf==6.21.4

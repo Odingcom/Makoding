@@ -45,6 +45,7 @@ from makoding import (
 
 from makoding.ui import shell
 from makoding.ui.cleaning_studio import ensure_processing_state, render_cleaning_studio
+from makoding.ui.validation_studio import render_validation_studio, render_validation_notice
 
 from makoding.config import (
     APP,
@@ -1182,7 +1183,11 @@ if active_workspace == "home":
 # ============================================================================
 
 if active_workspace == "clean":
-    render_cleaning_studio(st.session_state["dataframe"])
+    cleaning_tab, validation_tab = st.tabs(["Cleaning Studio", "Data Validation"])
+    with cleaning_tab:
+        render_cleaning_studio(st.session_state["dataframe"])
+    with validation_tab:
+        render_validation_studio(st.session_state["working_dataframe"])
 
 
 if active_workspace == "reports":
@@ -1442,6 +1447,7 @@ if active_workspace == "explore":
 # ============================================================================
 
 if active_workspace == "statistics":
+    render_validation_notice()
     statistical_ui.render_statistical_analysis(current_dataset)
 
 
@@ -1899,6 +1905,7 @@ if active_workspace == "features":
 # ============================================================================
 
 if active_workspace == "models":
+    render_validation_notice()
 
     styling.render_section(
         "Model builder",
@@ -2301,6 +2308,7 @@ if active_workspace == "models":
 # ============================================================================
 
 if active_workspace == "clustering":
+    render_validation_notice()
 
     styling.render_section(
         "Unsupervised learning",

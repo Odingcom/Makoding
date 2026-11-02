@@ -46,6 +46,7 @@ from makoding import (
 from makoding.ui import shell
 from makoding.ui.cleaning_studio import ensure_processing_state, render_cleaning_studio
 from makoding.ui.validation_studio import render_validation_studio, render_validation_notice
+from makoding.ui.pipeline_studio import render_pipeline_studio
 
 from makoding.config import (
     APP,
@@ -1183,11 +1184,15 @@ if active_workspace == "home":
 # ============================================================================
 
 if active_workspace == "clean":
-    cleaning_tab, validation_tab = st.tabs(["Cleaning Studio", "Data Validation"])
+    cleaning_tab, validation_tab, pipeline_tab = st.tabs(
+        ["Cleaning Studio", "Data Validation", "Pipelines"]
+    )
     with cleaning_tab:
         render_cleaning_studio(st.session_state["dataframe"])
     with validation_tab:
         render_validation_studio(st.session_state["working_dataframe"])
+    with pipeline_tab:
+        render_pipeline_studio(st.session_state["dataframe"])
 
 
 if active_workspace == "reports":
